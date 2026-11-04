@@ -255,7 +255,9 @@ func runStdio(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("serving MCP over stdio", "db", paths.DB, "export_dir", exportDir)
-	if err := mcpserver.New(st, exportDir, version).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
+	srv := mcpserver.New(st, exportDir, version)
+	mcpserver.CancelOnDone(ctx, srv) // a signal interrupts running tools
+	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		return err
 	}
 	return nil

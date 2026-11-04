@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -194,5 +195,48 @@ func TestSyncInProgressMessage(t *testing.T) {
 	res := call(t, cs, "search_establishments", map[string]any{})
 	if !res.IsError || !strings.Contains(text(res), "sync in progress") {
 		t.Errorf("IsError=%v text=%q", res.IsError, text(res))
+	}
+}
+
+// TestCancelOnDoneInterruptsTools checks that a shutdown cancels a running
+// sql_query instead of letting it run to its 30-second timeout.
+func TestCancelOnDoneInterruptsTools(t *testing.T) {
+	ctx := context.Background()
+	srv := New(fixtureStore(t), t.TempDir(), "test")
+	shutdown, stop := context.WithCancel(ctx)
+	CancelOnDone(shutdown, srv)
+	serverT, clientT := mcp.NewInMemoryTransports()
+	ss, err := srv.Connect(ctx, serverT, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ss.Close() })
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil).Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	type out struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	done := make(chan out, 1)
+	go func() {
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "sql_query",
+			Arguments: map[string]any{"query": "SELECT count(*) FROM range(100000000000) a, range(1000) b"}})
+		done <- out{res, err}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	start := time.Now()
+	stop()
+	select {
+	case o := <-done:
+		if o.err == nil && !o.res.IsError {
+			t.Fatalf("query succeeded: %+v", o.res)
+		}
+		t.Logf("returned %v after shutdown (err=%v)", time.Since(start), o.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("sql_query kept running after shutdown")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -99,6 +100,9 @@ func runServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A signal cancels running tools (queries, exports), so that Shutdown
+	// below and st.Close do not wait for them.
+	mcpserver.CancelOnDone(ctx, srv)
 
 	if autoSync {
 		_, statErr := os.Stat(paths.DB)
@@ -118,7 +122,8 @@ func runServe(args []string) error {
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpserver.RequireBearer(token, handler))
-	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
 
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.ListenAndServe() }()

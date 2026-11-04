@@ -100,6 +100,23 @@ func entriesOut(es []nomenclature.Entry) EntriesOut {
 	return EntriesOut{Total: len(es), Entries: es}
 }
 
+// CancelOnDone makes every request srv receives from now on see its context
+// cancelled once ctx is done, so that a shutdown interrupts running tools
+// (DuckDB queries stop on context cancellation) instead of waiting for them.
+// Request contexts are otherwise detached from the transport's: neither the
+// HTTP server's base context nor the stdio Run context reaches them.
+func CancelOnDone(ctx context.Context, srv *mcp.Server) {
+	srv.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(rctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			rctx, cancel := context.WithCancelCause(rctx)
+			defer cancel(nil)
+			stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+			defer stop()
+			return next(rctx, method, req)
+		}
+	})
+}
+
 // New builds the MCP server over s; exports are written under exportDir.
 func New(s *store.Store, exportDir, version string) *mcp.Server {
 	h := &server{store: s, exportDir: exportDir}
