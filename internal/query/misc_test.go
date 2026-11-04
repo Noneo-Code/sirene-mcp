@@ -111,14 +111,14 @@ func TestSearchNomenclatureAliases(t *testing.T) {
 	for _, tc := range []struct {
 		table, text, code, label string
 	}{
-		{"naf", "kiné", "86.90E", "Activités des professionnels de la rééducation, de l'appareillage et des pédicures-podologues"},
+		{"naf", "kiné", "86.90E", "Activités des professionnels de la rééducation, de l'appareillage et des pédicures-podologues"}, //nolint:misspell // French
 		{"naf", "KINESITHERAPIE", "86.90E", ""},
 		{"naf", "kinésithérapeute", "86.90E", ""},
 		{"naf", "ostéopathe", "86.90E", ""},
 		{"naf", "plombier", "43.22A", "Travaux d'installation d'eau et de gaz en tous locaux"},
 		{"naf", "expert comptable", "69.20Z", ""},
 		{"naf", "médecin", "86.21Z", ""},
-		{"naf2025", "kiné", "86.95Y", "Activités de physiothérapie"},
+		{"naf2025", "kiné", "86.95Y", "Activités de physiothérapie"}, //nolint:misspell // French
 	} {
 		es, err := SearchNomenclature(context.Background(), s, tc.table, tc.text, 0)
 		if err != nil {
