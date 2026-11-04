@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -45,6 +47,56 @@ func TestLoadOrCreateToken(t *testing.T) {
 	second, _ := LoadOrCreateToken(path)
 	if second != first {
 		t.Error("token changed between calls")
+	}
+}
+
+// TestLoadOrCreateTokenConcurrent starts many first uses at once: they must
+// all return the token that ends up in the file.
+func TestLoadOrCreateTokenConcurrent(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		path := filepath.Join(t.TempDir(), "sub", "token")
+		const n = 16
+		got := make([]string, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				got[i], errs[i] = LoadOrCreateToken(path)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		onDisk := strings.TrimSpace(string(b))
+		for i := range n {
+			if errs[i] != nil || got[i] != onDisk {
+				t.Fatalf("round %d caller %d: token %q err %v, file has %q", round, i, got[i], errs[i], onDisk)
+			}
+		}
+		if left, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".token-*")); len(left) != 0 {
+			t.Fatalf("temporary files left: %v", left)
+		}
+	}
+}
+
+func TestLoadOrCreateTokenReplacesEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := LoadOrCreateToken(path)
+	if err != nil || len(tok) != 64 {
+		t.Fatalf("token %q, err %v", tok, err)
+	}
+	if again, _ := LoadOrCreateToken(path); again != tok {
+		t.Fatalf("token changed: %q then %q", tok, again)
 	}
 }
 
