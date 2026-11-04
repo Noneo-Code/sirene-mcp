@@ -127,7 +127,7 @@ func (s *Store) reopen(fi os.FileInfo) error {
 	}
 	locked, lockedPath, err := openLocked(s.path)
 	if err != nil {
-		main.Close()
+		_ = main.Close()
 		return err
 	}
 	s.main, s.locked, s.lockedPath, s.info = main, locked, lockedPath, fi
@@ -153,7 +153,7 @@ func openLocked(path string) (*sql.DB, string, error) {
 	db.SetMaxIdleConns(0)
 	var attached string
 	if err := db.QueryRow("SELECT path FROM duckdb_databases() WHERE database_name = 'sirene'").Scan(&attached); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, "", fmt.Errorf("store: open %s: %w", path, err)
 	}
 	return db, attached, nil
@@ -183,7 +183,7 @@ func (s *Store) rebuildLocked(bad *sql.DB) {
 	if s.closed || s.locked != bad {
 		return
 	}
-	bad.Close()
+	_ = bad.Close()
 	s.locked = nil
 	db, attached, err := openLocked(s.path)
 	if err != nil {
@@ -216,7 +216,7 @@ func openPool(path string, settings []string) (*sql.DB, error) {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
 	if err := setup(c, path, settings); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, err
 	}
 	ready.Store(true)
@@ -233,7 +233,7 @@ func setup(c *duckdb.Connector, path string, settings []string) error {
 	if err != nil {
 		return fmt.Errorf("store: open %s: %w", path, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	execer := conn.(driver.ExecerContext)
 	stmts := append([]string{
 		"ATTACH " + quote(path) + " AS sirene (READ_ONLY)",
@@ -271,10 +271,10 @@ func (s *Store) dropPools() {
 
 func (s *Store) closePools() {
 	if s.main != nil {
-		s.main.Close()
+		_ = s.main.Close()
 	}
 	if s.locked != nil {
-		s.locked.Close()
+		_ = s.locked.Close()
 	}
 	s.main, s.locked, s.lockedPath, s.info = nil, nil, "", nil
 }

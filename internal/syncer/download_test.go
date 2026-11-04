@@ -23,7 +23,7 @@ func TestDownloadFollowsRedirect(t *testing.T) {
 	mux.HandleFunc("/r", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/file", http.StatusFound)
 	})
-	mux.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/file", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Last-Modified", "Tue, 03 Nov 2026 10:00:00 GMT")
 		_, _ = w.Write([]byte("abc"))
 	})
@@ -48,7 +48,7 @@ func TestDownloadFollowsRedirect(t *testing.T) {
 func TestDownloadRetriesThenSucceeds(t *testing.T) {
 	fastBackoff(t)
 	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if atomic.AddInt32(&hits, 1) < 3 {
 			http.Error(w, "boom", 500)
 			return
@@ -66,7 +66,7 @@ func TestDownloadRetriesThenSucceeds(t *testing.T) {
 
 func TestDownloadTruncatedFails(t *testing.T) {
 	fastBackoff(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "10")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("12345"))
@@ -87,7 +87,7 @@ func TestDownloadTruncatedFails(t *testing.T) {
 
 func TestDownloadEmptyBodyFails(t *testing.T) {
 	fastBackoff(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	defer srv.Close()
 	if _, err := Download(context.Background(), srv.Client(), srv.URL, t.TempDir()+"/f"); err == nil {
 		t.Fatal("expected error")
@@ -98,7 +98,7 @@ func TestDownloadNoRetryAfterCancel(t *testing.T) {
 	downloadBackoff = time.Second
 	defer func() { downloadBackoff = 2 * time.Second }()
 	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		http.Error(w, "x", 500)
 	}))

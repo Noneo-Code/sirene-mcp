@@ -128,13 +128,13 @@ func checkRatio(dbPath string, got BuildStats, o Options, log *slog.Logger) erro
 	if prevClosed != o.ExcludeClosed {
 		return nil
 	}
-	min := o.MinRatio
-	if min == 0 {
-		min = defaultMinRatio
+	minRatio := o.MinRatio
+	if minRatio == 0 {
+		minRatio = defaultMinRatio
 	}
-	if float64(got.ULRows) < min*float64(prev.ULRows) || float64(got.EtabRows) < min*float64(prev.EtabRows) {
+	if float64(got.ULRows) < minRatio*float64(prev.ULRows) || float64(got.EtabRows) < minRatio*float64(prev.EtabRows) {
 		return fmt.Errorf("new database rejected: row ratio below %.2f (unite_legale %d vs %d, etablissement %d vs %d); live database left untouched",
-			min, got.ULRows, prev.ULRows, got.EtabRows, prev.EtabRows)
+			minRatio, got.ULRows, prev.ULRows, got.EtabRows, prev.EtabRows)
 	}
 	return nil
 }

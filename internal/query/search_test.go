@@ -23,7 +23,7 @@ func testStore(t *testing.T) *store.Store {
 		t.Fatalf("Build: %v", err)
 	}
 	s := store.Open(out)
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 

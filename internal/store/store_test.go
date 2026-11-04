@@ -58,7 +58,7 @@ func place(t *testing.T, src, dst string) {
 		t.Fatal(err)
 	}
 	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil { //nolint:gosec // G703: test-only temp path
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
@@ -81,7 +81,7 @@ func countUL(t *testing.T, s *Store) int64 {
 func openStore(t *testing.T, path string) *Store {
 	t.Helper()
 	s := Open(path)
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -273,7 +273,7 @@ func TestLockedPoolBlocksFiles(t *testing.T) {
 	// The main pool keeps external access (export uses COPY … TO) and is read-only.
 	out := filepath.Join(t.TempDir(), "out.csv")
 	if err := s.Use(ctx, func(db *sql.DB) error {
-		_, err := db.ExecContext(ctx, "COPY (SELECT siren FROM unite_legale) TO '"+out+"' (HEADER)")
+		_, err := db.ExecContext(ctx, "COPY (SELECT siren FROM unite_legale) TO '"+out+"' (HEADER)") //nolint:gosec // G202: test-only temp path
 		return err
 	}); err != nil {
 		t.Fatalf("main pool COPY TO: %v", err)

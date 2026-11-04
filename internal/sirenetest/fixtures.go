@@ -126,7 +126,7 @@ func writeParquet(t testing.TB, path, table string, columns []column, rows []map
 	if _, err := db.Exec(fmt.Sprintf("CREATE TABLE %s (%s)", table, strings.Join(defs, ", "))); err != nil {
 		t.Fatal(err)
 	}
-	insert := fmt.Sprintf("INSERT INTO %s VALUES (%s)", table, strings.Join(marks, ", "))
+	insert := fmt.Sprintf("INSERT INTO %s VALUES (%s)", table, strings.Join(marks, ", ")) //nolint:gosec // G201: test fixture, table name is a constant
 	for _, r := range rows {
 		args := make([]any, len(columns))
 		for i, c := range columns {

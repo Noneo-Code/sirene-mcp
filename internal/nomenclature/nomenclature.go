@@ -38,7 +38,7 @@ func mustLoad(src map[string]string) map[string][]Entry {
 			panic(fmt.Sprintf("nomenclature: %v", err))
 		}
 		recs, err := csv.NewReader(f).ReadAll()
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			panic(fmt.Sprintf("nomenclature: %s: %v", path, err))
 		}

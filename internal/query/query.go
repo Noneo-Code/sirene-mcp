@@ -185,6 +185,7 @@ func Count(ctx context.Context, s *store.Store, f Filters, groupBy string) (Coun
 		if join != "" {
 			label = "coalesce(any_value(l.libelle),'')"
 		}
+		//nolint:gosec // G201: col/label/join come from a fixed whitelist, values are bound
 		q := fmt.Sprintf(`SELECT coalesce(%[1]s,''), %[2]s, count(*) AS c FROM etablissement e %[3]s WHERE %[4]s
 GROUP BY coalesce(%[1]s,'') ORDER BY c DESC, 1`, col, label, join, where)
 		rows, err := db.QueryContext(ctx, q, args...)

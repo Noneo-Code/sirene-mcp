@@ -8,6 +8,10 @@ linters:
     - revive
     - unconvert
   settings:
+    misspell:
+      ignore-rules:
+        - activite
+        - employeur
     gosec:
       excludes:
         - G304

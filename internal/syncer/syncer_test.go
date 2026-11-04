@@ -179,7 +179,7 @@ func TestRunLocked(t *testing.T) {
 	if ok, err := l.TryLock(); err != nil || !ok {
 		t.Fatalf("lock: %v %v", ok, err)
 	}
-	defer l.Unlock()
+	defer func() { _ = l.Unlock() }()
 	_, err := Run(context.Background(), p, fs.Client(), fs.opts, quietLog())
 	if err == nil || !strings.Contains(err.Error(), "another sync") {
 		t.Fatalf("err = %v", err)
