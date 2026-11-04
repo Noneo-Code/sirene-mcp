@@ -234,7 +234,9 @@ SELECT
 		code_postal, coalesce(libelle_commune, libelle_commune_etranger), libelle_pays_etranger), '') AS adresse_complete,
 	nom_affiche,
 	-- strip_accents keeps the ligatures; fold them like the query side does.
-	replace(replace(strip_accents(lower(concat_ws(' ', nom_affiche, ul_sigle, ul_denomination))),
+	-- denomination_usuelle goes in on its own: nom_affiche prefers the enseigne,
+	-- which would otherwise hide the usual name from name searches.
+	replace(replace(strip_accents(lower(concat_ws(' ', nom_affiche, denomination_usuelle, ul_sigle, ul_denomination))),
 		'œ', 'oe'), 'æ', 'ae') AS nom_recherche,
 	categorie_juridique,
 	categorie_entreprise

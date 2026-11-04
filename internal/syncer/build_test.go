@@ -247,3 +247,26 @@ func TestBuildFoldsLigaturesInNomRecherche(t *testing.T) {
 		t.Errorf("nom_recherche = %q, want ligatures folded (coeur aelia)", nom)
 	}
 }
+
+// TestBuildNomRechercheKeepsDenominationUsuelle covers an establishment with
+// both an enseigne (shown as nom_affiche) and a dénomination usuelle: the usual
+// name must stay searchable.
+func TestBuildNomRechercheKeepsDenominationUsuelle(t *testing.T) {
+	ul, etab := sirenetest.Default()
+	etab = append(etab, sirenetest.Etab{
+		"siren": "111111111", "nic": "00052", "siret": "11111111100052", "statutDiffusionEtablissement": "O",
+		"etablissementSiege": "false", "codeCommuneEtablissement": "30189", "codePostalEtablissement": "30000",
+		"etatAdministratifEtablissement": "A", "activitePrincipaleEtablissement": "86.90E",
+		"enseigne1Etablissement": "LE PETIT ATELIER", "denominationUsuelleEtablissement": "Kiné Garrigue",
+	})
+	_, out := build(t, ul, etab, false)
+	db := openRO(t, out)
+	var affiche, nom string
+	queryRow(t, db, "SELECT nom_affiche, nom_recherche FROM etablissement WHERE siret = ?", []any{"11111111100052"}, &affiche, &nom)
+	if affiche != "LE PETIT ATELIER" {
+		t.Errorf("nom_affiche = %q, want the enseigne", affiche)
+	}
+	if !strings.Contains(nom, "le petit atelier") || !strings.Contains(nom, "kine garrigue") {
+		t.Errorf("nom_recherche = %q, want both the enseigne and the dénomination usuelle", nom)
+	}
+}
