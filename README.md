@@ -61,11 +61,15 @@ Requirements:
 
 | | Full sync | `--exclude-closed` |
 |---|---|---|
-| Download | ~0.7 GB + ~2.2 GB Parquet <!-- measured in Task 12 --> | <!-- measured in Task 12 --> |
-| Disk (database) | <!-- measured in Task 12 --> | <!-- measured in Task 12 --> |
-| Peak disk during a sync | <!-- measured in Task 12 --> (old and new database coexist, plus the downloads) | <!-- measured in Task 12 --> |
-| RAM | <!-- measured in Task 12 --> (default `--memory-limit 4GB`) | <!-- measured in Task 12 --> |
-| Duration | <!-- measured in Task 12 --> | <!-- measured in Task 12 --> |
+| Download | ~0.7 GB + ~2.2 GB Parquet (same files) | same |
+| Rows | ~30.3M legal units, ~44.5M establishments | ~16.8M legal units, ~16.9M establishments |
+| Disk (database) | ~9.6 GB | ~4.3 GB |
+| Peak disk during a sync | ~35 GB (old and new database coexist, plus the downloads and DuckDB temp files) | ~21 GB |
+| RAM | ~5 GB peak RSS (default `--memory-limit 4GB`) | ~4.2 GB peak RSS |
+| Duration | ~3.5 min (download ~2 min, build ~1.5 min) | ~2 min (build ~30 s) |
+
+Measured on the Nov 2026 stock, Apple M-series, 18 GB RAM, on a fast home connection. Durations
+are dominated by the download speed.
 
 Source URLs can be overridden with `--ul-url` / `--etab-url` (or `SIRENE_MCP_UL_URL` /
 `SIRENE_MCP_ETAB_URL`), for instance to point at a mirror.
