@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -53,11 +54,13 @@ const usage = `sirene-mcp - MCP server over a local DuckDB copy of the INSEE Sir
 Usage:
   sirene-mcp sync   [--ul-url URL] [--etab-url URL]  Download the stock files and rebuild the local database
                     [--exclude-closed]               Skip closed establishments and legal units
+                    [--memory-limit 4GB]             DuckDB memory limit for the build
   sirene-mcp stdio  [--export-dir DIR]               Run the MCP server over stdio
+                    [--memory-limit SIZE]            DuckDB memory limit for queries (default 80% of RAM)
   sirene-mcp serve  [--addr 127.0.0.1:8766]          Run the MCP server over Streamable HTTP (bearer token)
                     [--allow-remote]                 Allow a non-loopback address (put it behind TLS)
                     [--auto-sync]                    Refresh the database monthly (accepts the sync flags)
-                    [--export-dir DIR]
+                    [--export-dir DIR] [--memory-limit SIZE]
   sirene-mcp token                                   Print the bearer token used by serve
   sirene-mcp status                                  Show the database and last sync
   sirene-mcp version
@@ -65,6 +68,15 @@ Usage:
 Global flags (put them after the command):
   --data-dir DIR    Data directory (default: $SIRENE_MCP_DATA_DIR or <user cache dir>/sirene-mcp)
   --log-level LVL   debug, info, warn or error
+
+Environment variables (a flag on the command line wins):
+  SIRENE_MCP_DATA_DIR        --data-dir
+  SIRENE_MCP_UL_URL          --ul-url
+  SIRENE_MCP_ETAB_URL        --etab-url
+  SIRENE_MCP_EXCLUDE_CLOSED  --exclude-closed (true/false, 1/0)
+  SIRENE_MCP_MEMORY_LIMIT    --memory-limit
+  SIRENE_MCP_EXPORT_DIR      --export-dir
+  SIRENE_MCP_TOKEN           bearer token for serve (at least 16 characters; default: generated and stored in the data dir)
 
 Run "sirene-mcp <command> --help" for details.
 `
@@ -134,6 +146,29 @@ func envOr(key, def string) string {
 	return def
 }
 
+// envBool reads a boolean environment variable; unset or empty is false.
+func envBool(key string) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("$%s: invalid boolean %q (use true or false)", key, v)
+	}
+	return b, nil
+}
+
+// memoryLimitFlag registers --memory-limit with $SIRENE_MCP_MEMORY_LIMIT as default.
+func memoryLimitFlag(fs *flag.FlagSet, dst *string, usage string) {
+	fs.StringVar(dst, "memory-limit", os.Getenv("SIRENE_MCP_MEMORY_LIMIT"), usage+" ($SIRENE_MCP_MEMORY_LIMIT)")
+}
+
+// exportDirFlag registers --export-dir with $SIRENE_MCP_EXPORT_DIR as default.
+func exportDirFlag(fs *flag.FlagSet, dst *string) {
+	fs.StringVar(dst, "export-dir", os.Getenv("SIRENE_MCP_EXPORT_DIR"), "directory for export files (default <data dir>/exports; $SIRENE_MCP_EXPORT_DIR)")
+}
+
 func parse(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -148,17 +183,25 @@ func parse(fs *flag.FlagSet, args []string) error {
 }
 
 // syncFlags registers the sync options shared by `sync` and `serve --auto-sync`.
-func syncFlags(fs *flag.FlagSet, o *syncer.Options) {
+// Environment variables provide the defaults; flags win.
+func syncFlags(fs *flag.FlagSet, o *syncer.Options) error {
+	excludeClosed, err := envBool("SIRENE_MCP_EXCLUDE_CLOSED")
+	if err != nil {
+		return err
+	}
 	fs.StringVar(&o.ULURL, "ul-url", envOr("SIRENE_MCP_UL_URL", defaultULURL), "unite legale stock URL ($SIRENE_MCP_UL_URL)")
 	fs.StringVar(&o.EtabURL, "etab-url", envOr("SIRENE_MCP_ETAB_URL", defaultEtabURL), "etablissement stock URL ($SIRENE_MCP_ETAB_URL)")
-	fs.BoolVar(&o.ExcludeClosed, "exclude-closed", false, "skip closed establishments and legal units")
-	fs.StringVar(&o.MemoryLimit, "memory-limit", "4GB", "DuckDB memory limit for the build")
+	fs.BoolVar(&o.ExcludeClosed, "exclude-closed", excludeClosed, "skip closed establishments and legal units ($SIRENE_MCP_EXCLUDE_CLOSED)")
+	memoryLimitFlag(fs, &o.MemoryLimit, "DuckDB memory limit, e.g. 4GB (sync build default 4GB; serve also applies it to queries)")
+	return nil
 }
 
 func runSync(args []string) error {
 	fs, c := newFlags("sync")
 	var o syncer.Options
-	syncFlags(fs, &o)
+	if err := syncFlags(fs, &o); err != nil {
+		return err
+	}
 	fs.BoolVar(&o.KeepDownloads, "keep-downloads", false, "keep the downloaded Parquet files")
 	if err := parse(fs, args); err != nil {
 		return err
@@ -187,8 +230,9 @@ func runSync(args []string) error {
 
 func runStdio(args []string) error {
 	fs, c := newFlags("stdio")
-	var exportDir string
-	fs.StringVar(&exportDir, "export-dir", "", "directory for export files (default <data dir>/exports)")
+	var exportDir, memoryLimit string
+	exportDirFlag(fs, &exportDir)
+	memoryLimitFlag(fs, &memoryLimit, "DuckDB memory limit for queries, e.g. 4GB (default 80% of RAM)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -206,7 +250,7 @@ func runStdio(args []string) error {
 	if exportDir == "" {
 		exportDir = paths.ExportDir
 	}
-	st := store.Open(paths.DB)
+	st := store.OpenWith(paths.DB, store.Options{TempDir: paths.WorkDir, MemoryLimit: memoryLimit})
 	defer st.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

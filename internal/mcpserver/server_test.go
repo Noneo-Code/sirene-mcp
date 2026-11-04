@@ -186,3 +186,13 @@ func TestNomenclatureToolsNotTruncated(t *testing.T) {
 		t.Errorf("search_naf kiné: %+v", out)
 	}
 }
+
+func TestSyncInProgressMessage(t *testing.T) {
+	s := store.Open(filepath.Join(t.TempDir(), "missing.duckdb"))
+	s.SetSyncing(true)
+	cs := connect(t, s)
+	res := call(t, cs, "search_establishments", map[string]any{})
+	if !res.IsError || !strings.Contains(text(res), "sync in progress") {
+		t.Errorf("IsError=%v text=%q", res.IsError, text(res))
+	}
+}

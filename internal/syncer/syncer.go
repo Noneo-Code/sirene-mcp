@@ -21,12 +21,15 @@ import (
 type Options struct {
 	ULURL, EtabURL string
 	ExcludeClosed  bool
-	MemoryLimit    string
+	MemoryLimit    string // DuckDB memory limit for the build; "" means 4GB
 	KeepDownloads  bool
 	MinRatio       float64 // minimum new/previous row ratio; 0 means 0.9
 }
 
-const defaultMinRatio = 0.9
+const (
+	defaultMinRatio    = 0.9
+	defaultMemoryLimit = "4GB"
+)
 
 // Run downloads the stocks, builds a new database next to the live one,
 // sanity-checks it against the previous sync, and atomically swaps it in.
@@ -34,6 +37,9 @@ const defaultMinRatio = 0.9
 func Run(ctx context.Context, p config.Paths, client *http.Client, o Options, log *slog.Logger) (stats BuildStats, err error) {
 	if err := p.Ensure(); err != nil {
 		return stats, err
+	}
+	if o.MemoryLimit == "" {
+		o.MemoryLimit = defaultMemoryLimit
 	}
 	lock := flock.New(p.LockFile)
 	ok, err := lock.TryLock()

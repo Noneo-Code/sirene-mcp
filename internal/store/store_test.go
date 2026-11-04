@@ -397,3 +397,36 @@ func TestLockedPoolNotRebuiltWhenHealthy(t *testing.T) {
 		t.Fatal("broken locked pool was not rebuilt")
 	}
 }
+
+func TestOpenWithAppliesMainSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	tmp := filepath.Join(t.TempDir(), "work")
+	s := OpenWith(path, Options{TempDir: tmp, MemoryLimit: "512MB"})
+	t.Cleanup(func() { _ = s.Close() })
+	var dir, mem string
+	err := s.Use(context.Background(), func(db *sql.DB) error {
+		return db.QueryRow("SELECT current_setting('temp_directory'), current_setting('memory_limit')").Scan(&dir, &mem)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != tmp {
+		t.Errorf("temp_directory = %q, want %q", dir, tmp)
+	}
+	if len(mem) < 3 || mem[len(mem)-3:] != "MiB" { // DuckDB reports 512MB as "488.2 MiB"; its default is in GiB
+		t.Errorf("memory_limit = %q, want about 512MB", mem)
+	}
+}
+
+func TestSyncInProgressMessage(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "sirene.duckdb"))
+	s.SetSyncing(true)
+	if err := s.Use(context.Background(), func(*sql.DB) error { return nil }); !errors.Is(err, ErrSyncInProgress) {
+		t.Fatalf("err = %v, want ErrSyncInProgress", err)
+	}
+	s.SetSyncing(false)
+	if err := s.Use(context.Background(), func(*sql.DB) error { return nil }); !errors.Is(err, ErrNoDatabase) {
+		t.Fatalf("err = %v, want ErrNoDatabase", err)
+	}
+}

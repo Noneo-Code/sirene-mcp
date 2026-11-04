@@ -20,10 +20,26 @@ import (
 // ErrNoDatabase is returned while the database file does not exist.
 var ErrNoDatabase = errors.New(`no Sirene database yet: run "sirene-mcp sync"`)
 
+// ErrSyncInProgress replaces ErrNoDatabase while the first sync is building
+// the database (see SetSyncing).
+var ErrSyncInProgress = errors.New("the Sirene database is being built by a sync in progress (download and build take a while); retry later")
+
+// Options tunes the main read-only pool.
+type Options struct {
+	// TempDir is where DuckDB spills large queries; "" leaves DuckDB's default
+	// (a .tmp directory in the process's working directory).
+	TempDir string
+	// MemoryLimit caps the main pool, in DuckDB syntax ("4GB"); "" leaves
+	// DuckDB's default (80% of RAM).
+	MemoryLimit string
+}
+
 // Store is a lazily opened, read-only handle on the database file. It is safe
 // for concurrent use.
 type Store struct {
-	path string
+	path    string
+	opts    Options
+	syncing atomic.Bool
 
 	mu     sync.RWMutex
 	info   os.FileInfo // identity of the file the pools were opened on
@@ -35,10 +51,23 @@ type Store struct {
 	closed     bool
 }
 
-// Open returns a Store for path. It never fails: the file is opened on first use.
-func Open(path string) *Store { return &Store{path: path} }
+// Open returns a Store for path with default Options. It never fails: the
+// file is opened on first use.
+func Open(path string) *Store { return OpenWith(path, Options{}) }
+
+// OpenWith is Open with options for the main pool.
+func OpenWith(path string, o Options) *Store { return &Store{path: path, opts: o} }
+
+// SetSyncing tells the store whether a sync is running, so that a missing
+// database is reported as ErrSyncInProgress rather than ErrNoDatabase.
+func (s *Store) SetSyncing(v bool) { s.syncing.Store(v) }
 
 // Use runs fn with the main read-only pool.
+//
+// fn runs under the store's read lock, which a swap of the database file waits
+// for: Use and UseLocked are not reentrant (never call either from inside fn,
+// a pending swap would deadlock them), and a long fn delays swaps for every
+// other caller.
 func (s *Store) Use(ctx context.Context, fn func(db *sql.DB) error) error {
 	return s.use(ctx, false, fn)
 }
@@ -48,7 +77,8 @@ func (s *Store) Use(ctx context.Context, fn func(db *sql.DB) error) error {
 // ':memory:', CREATE TABLE in the memory catalog…), the next call gets a clean
 // pool: connections are never reused, and after fn a health check rebuilds the
 // locked instance if it was altered. Calls running concurrently with a hostile
-// fn may still see its effects.
+// fn may still see its effects. Like Use, it is not reentrant and a long fn
+// delays swaps.
 func (s *Store) UseLocked(ctx context.Context, fn func(db *sql.DB) error) error {
 	return s.use(ctx, true, fn)
 }
@@ -61,6 +91,9 @@ func (s *Store) use(ctx context.Context, locked bool, fn func(db *sql.DB) error)
 		fi, err := s.stat()
 		if errors.Is(err, ErrNoDatabase) {
 			s.dropPools() // release the handle on the deleted file
+			if s.syncing.Load() {
+				return ErrSyncInProgress
+			}
 		}
 		if err != nil {
 			return err
@@ -121,7 +154,7 @@ func (s *Store) reopen(fi os.FileInfo) error {
 		return nil
 	}
 	s.closePools()
-	main, err := openPool(s.path, nil)
+	main, err := openPool(s.path, s.mainSettings())
 	if err != nil {
 		return err
 	}
@@ -132,6 +165,18 @@ func (s *Store) reopen(fi os.FileInfo) error {
 	}
 	s.main, s.locked, s.lockedPath, s.info = main, locked, lockedPath, fi
 	return nil
+}
+
+// mainSettings are applied once per main instance.
+func (s *Store) mainSettings() []string {
+	var out []string
+	if s.opts.TempDir != "" {
+		out = append(out, "SET temp_directory = "+quote(s.opts.TempDir))
+	}
+	if s.opts.MemoryLimit != "" {
+		out = append(out, "SET memory_limit = "+quote(s.opts.MemoryLimit))
+	}
+	return out
 }
 
 // lockedSettings are applied once per locked instance, before the pool is used.

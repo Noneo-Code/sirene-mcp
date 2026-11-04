@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,8 +20,15 @@ import (
 	"github.com/Noneo-Code/sirene-mcp/internal/syncer"
 )
 
+// minTokenLen is the shortest bearer token accepted from $SIRENE_MCP_TOKEN.
+const minTokenLen = 16
+
 func resolveToken(p config.Paths) (string, error) {
-	if t := os.Getenv("SIRENE_MCP_TOKEN"); t != "" {
+	if raw, ok := os.LookupEnv("SIRENE_MCP_TOKEN"); ok && raw != "" {
+		t := strings.TrimSpace(raw)
+		if len(t) < minTokenLen {
+			return "", fmt.Errorf("$SIRENE_MCP_TOKEN must be at least %d characters (got %d after trimming whitespace)", minTokenLen, len(t))
+		}
 		return t, nil
 	}
 	return mcpserver.LoadOrCreateToken(p.TokenFile)
@@ -57,8 +65,10 @@ func runServe(args []string) error {
 	fs.StringVar(&addr, "addr", "127.0.0.1:8766", "listen address")
 	fs.BoolVar(&allowRemote, "allow-remote", false, "allow a non-loopback address (put it behind a TLS reverse proxy)")
 	fs.BoolVar(&autoSync, "auto-sync", false, "refresh the database on the monthly schedule")
-	fs.StringVar(&exportDir, "export-dir", "", "directory for export files (default <data dir>/exports)")
-	syncFlags(fs, &o)
+	exportDirFlag(fs, &exportDir)
+	if err := syncFlags(fs, &o); err != nil {
+		return err
+	}
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -83,7 +93,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	st := store.Open(paths.DB)
+	st := store.OpenWith(paths.DB, store.Options{TempDir: paths.WorkDir, MemoryLimit: o.MemoryLimit})
 	defer st.Close()
 	srv := mcpserver.New(st, exportDir, version)
 
@@ -94,6 +104,8 @@ func runServe(args []string) error {
 		_, statErr := os.Stat(paths.DB)
 		client := &http.Client{Timeout: 2 * time.Hour}
 		go autoSyncLoop(ctx, statErr == nil, time.Now, time.After, func(ctx context.Context) error {
+			st.SetSyncing(true)
+			defer st.SetSyncing(false)
 			_, err := syncer.Run(ctx, paths, client, o, log)
 			return err
 		}, log)
@@ -125,14 +137,34 @@ func runServe(args []string) error {
 	}
 }
 
+// autoSyncRetries are the waits before each retry of a failed auto-sync: three
+// attempts over about an hour, then the loop waits for the next scheduled run.
+var autoSyncRetries = []time.Duration{15 * time.Minute, 45 * time.Minute}
+
 // autoSyncLoop syncs at startup when the database is missing, then sleeps until
 // each syncer.NextRun and syncs again until ctx is done. A failed sync is
-// logged and the loop carries on. now and after are injected for tests.
+// logged and retried after each of autoSyncRetries; if every attempt fails the
+// loop carries on to the next scheduled run. now and after are injected for
+// tests.
 func autoSyncLoop(ctx context.Context, dbExists bool, now func() time.Time,
 	after func(time.Duration) <-chan time.Time, sync func(context.Context) error, log *slog.Logger) {
 	run := func() {
-		if err := sync(ctx); err != nil && ctx.Err() == nil {
-			log.Error("auto-sync failed", "err", err)
+		for attempt := 0; ; attempt++ {
+			err := sync(ctx)
+			if err == nil || ctx.Err() != nil {
+				return
+			}
+			if attempt >= len(autoSyncRetries) {
+				log.Error("auto-sync failed, giving up until the next scheduled run", "attempts", attempt+1, "err", err)
+				return
+			}
+			wait := autoSyncRetries[attempt]
+			log.Error("auto-sync failed, retrying", "attempt", attempt+1, "retry_in", wait, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-after(wait):
+			}
 		}
 	}
 	if !dbExists {
