@@ -20,7 +20,11 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/Noneo-Code/sirene-mcp/internal/config"
+	"github.com/Noneo-Code/sirene-mcp/internal/mcpserver"
+	"github.com/Noneo-Code/sirene-mcp/internal/store"
 	"github.com/Noneo-Code/sirene-mcp/internal/syncer"
 )
 
@@ -49,7 +53,7 @@ const usage = `sirene-mcp - MCP server over a local DuckDB copy of the INSEE Sir
 Usage:
   sirene-mcp sync   [--ul-url URL] [--etab-url URL]  Download the stock files and rebuild the local database
                     [--exclude-closed]               Skip closed establishments and legal units
-  sirene-mcp stdio                                   Run the MCP server over stdio
+  sirene-mcp stdio  [--export-dir DIR]               Run the MCP server over stdio
   sirene-mcp serve  [--http 127.0.0.1:8766]          Run the MCP server over Streamable HTTP (bearer token)
                     [--allow-remote]                 Allow a non-loopback address (put it behind TLS)
                     [--auto-sync]                    Refresh the database on a schedule
@@ -83,6 +87,8 @@ func run(args []string) error {
 		return nil
 	case "sync":
 		return runSync(args[1:])
+	case "stdio":
+		return runStdio(args[1:])
 	case "status":
 		return runStatus(args[1:])
 	case "help", "--help", "-h":
@@ -166,6 +172,38 @@ func runSync(args []string) error {
 		return err
 	}
 	fmt.Printf("sync complete: %d legal units, %d establishments (%s)\n", stats.ULRows, stats.EtabRows, paths.DB)
+	return nil
+}
+
+func runStdio(args []string) error {
+	fs, c := newFlags("stdio")
+	var exportDir string
+	fs.StringVar(&exportDir, "export-dir", "", "directory for export files (default <data dir>/exports)")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	if helpRequested(args) {
+		return nil
+	}
+	log, err := newLogger(c.logLevel)
+	if err != nil {
+		return err
+	}
+	paths, err := config.Resolve(c.dataDir)
+	if err != nil {
+		return err
+	}
+	if exportDir == "" {
+		exportDir = paths.ExportDir
+	}
+	st := store.Open(paths.DB)
+	defer st.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	log.Info("serving MCP over stdio", "db", paths.DB, "export_dir", exportDir)
+	if err := mcpserver.New(st, exportDir, version).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
+		return err
+	}
 	return nil
 }
 
