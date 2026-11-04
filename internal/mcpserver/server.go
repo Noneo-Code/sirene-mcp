@@ -68,12 +68,12 @@ type companyIn struct {
 }
 
 type nafIn struct {
-	Text    string `json:"text" jsonschema:"words from the activity label, or a code or code prefix"`
+	Text    string `json:"text" jsonschema:"words from the activity label, a profession or business word (kiné, plombier...), or a code or code prefix; empty lists the whole table"`
 	Version string `json:"version,omitempty" jsonschema:"rev2 (default, NAF rev. 2) or 2025 (NAF 2025)"`
 }
 
 type legalIn struct {
-	Text string `json:"text" jsonschema:"words from the legal category label, or a code or code prefix"`
+	Text string `json:"text" jsonschema:"words from the legal category label, or a code or code prefix; empty lists the whole table"`
 }
 
 type exportIn struct {
@@ -88,9 +88,16 @@ type sqlIn struct {
 
 type emptyIn struct{}
 
-// EntriesOut is a list of nomenclature entries.
+// EntriesOut is the complete list of matching nomenclature entries (never
+// truncated); Total is its length.
 type EntriesOut struct {
+	Total   int                  `json:"total"`
 	Entries []nomenclature.Entry `json:"entries"`
+}
+
+func entriesOut(es []nomenclature.Entry) EntriesOut {
+	es = nonNil(es)
+	return EntriesOut{Total: len(es), Entries: es}
 }
 
 // New builds the MCP server over s; exports are written under exportDir.
@@ -111,9 +118,12 @@ func New(s *store.Store, exportDir, version string) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_company", Annotations: readOnly,
 		Description: "Look up one legal unit by SIREN or SIRET: identity, head office and a page of all its establishments."}, h.company)
 	mcp.AddTool(srv, &mcp.Tool{Name: "search_naf", Annotations: readOnly,
-		Description: "Find NAF activity codes by label words or code prefix, in NAF rev. 2 (default) or NAF 2025."}, h.naf)
+		Description: "Find NAF activity codes by label words, common profession words or code prefix, in NAF rev. 2 (default) or NAF 2025. " +
+			"Returns every match (total = number of entries). Labels are the official INSEE wording; " +
+			"profession words such as kiné or plombier are matched through a small curated alias list, which is only a hint: " +
+			"check the returned official label fits, and search related words when unsure."}, h.naf)
 	mcp.AddTool(srv, &mcp.Tool{Name: "search_legal_categories", Annotations: readOnly,
-		Description: "Find legal category codes (catégories juridiques: SAS, SARL, association...) by label words or code prefix."}, h.legal)
+		Description: "Find legal category codes (catégories juridiques: SAS, SARL, association...) by label words or code prefix. Returns every match (total = number of entries)."}, h.legal)
 	mcp.AddTool(srv, &mcp.Tool{Name: "export_establishments", Annotations: writesFile,
 		Description: "Write every establishment matching the filters to a CSV or JSON file on the server and return its path, row count and format. " +
 			"Use it for full lists instead of paging through search_establishments."}, h.export)
@@ -153,12 +163,12 @@ func (h *server) naf(ctx context.Context, _ *mcp.CallToolRequest, in nafIn) (*mc
 		return nil, EntriesOut{}, fmt.Errorf("version must be %q or %q, got %q", "rev2", "2025", in.Version)
 	}
 	entries, err := query.SearchNomenclature(ctx, h.store, table, in.Text, 0)
-	return nil, EntriesOut{Entries: nonNil(entries)}, err
+	return nil, entriesOut(entries), err
 }
 
 func (h *server) legal(ctx context.Context, _ *mcp.CallToolRequest, in legalIn) (*mcp.CallToolResult, EntriesOut, error) {
 	entries, err := query.SearchNomenclature(ctx, h.store, "categorie_juridique", in.Text, 0)
-	return nil, EntriesOut{Entries: nonNil(entries)}, err
+	return nil, entriesOut(entries), err
 }
 
 func (h *server) export(ctx context.Context, _ *mcp.CallToolRequest, in exportIn) (*mcp.CallToolResult, query.ExportResult, error) {

@@ -91,6 +91,59 @@ func TestSearchNomenclatureKine(t *testing.T) {
 	}
 }
 
+func TestSearchNomenclatureNoTruncation(t *testing.T) {
+	s := testStore(t)
+	for table, want := range map[string]int{"naf": 732, "categorie_juridique": 260, "tranche_effectifs": 16} {
+		es, err := SearchNomenclature(context.Background(), s, table, "", 0)
+		if err != nil || len(es) != want {
+			t.Errorf("%s: empty text gave %d entries (%v), want the whole table (%d)", table, len(es), err, want)
+		}
+	}
+	// "commerce" matches far more than the old silent cap of 50.
+	es, err := SearchNomenclature(context.Background(), s, "naf", "commerce", 0)
+	if err != nil || len(es) <= 50 {
+		t.Errorf("commerce: %d entries (%v), want > 50", len(es), err)
+	}
+}
+
+func TestSearchNomenclatureAliases(t *testing.T) {
+	s := testStore(t)
+	for _, tc := range []struct {
+		table, text, code, label string
+	}{
+		{"naf", "kiné", "86.90E", "Activités des professionnels de la rééducation, de l'appareillage et des pédicures-podologues"},
+		{"naf", "KINESITHERAPIE", "86.90E", ""},
+		{"naf", "kinésithérapeute", "86.90E", ""},
+		{"naf", "ostéopathe", "86.90E", ""},
+		{"naf", "plombier", "43.22A", "Travaux d'installation d'eau et de gaz en tous locaux"},
+		{"naf", "expert comptable", "69.20Z", ""},
+		{"naf", "médecin", "86.21Z", ""},
+		{"naf2025", "kiné", "86.95Y", "Activités de physiothérapie"},
+	} {
+		es, err := SearchNomenclature(context.Background(), s, tc.table, tc.text, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, e := range es {
+			if e.Code == tc.code {
+				found = true
+				if tc.label != "" && e.Label != tc.label {
+					t.Errorf("%+v: label %q, want the official one", tc, e.Label)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%+v: not found in %v", tc, es)
+		}
+	}
+	// Aliases do not leak into unrelated searches.
+	es, _ := SearchNomenclature(context.Background(), s, "naf", "kiné", 0)
+	if len(es) != 1 {
+		t.Errorf("kiné: %v, want only 86.90E", es)
+	}
+}
+
 func TestGetInfoIgnoresUnfinishedSync(t *testing.T) {
 	ul, etab := sirenetest.Default()
 	dir := t.TempDir()

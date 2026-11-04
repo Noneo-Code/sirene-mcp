@@ -146,3 +146,43 @@ func TestNoDatabaseMessage(t *testing.T) {
 		}
 	}
 }
+
+func nomenclatureCall(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any) EntriesOut {
+	t.Helper()
+	res := call(t, cs, tool, args)
+	if res.IsError {
+		t.Fatalf("%s: %s", tool, text(res))
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var out EntriesOut
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"code":`) || !strings.Contains(string(raw), `"label":`) {
+		t.Errorf("entries must use code/label keys: %.200s", raw)
+	}
+	if out.Total != len(out.Entries) {
+		t.Errorf("total %d != %d entries", out.Total, len(out.Entries))
+	}
+	return out
+}
+
+func TestNomenclatureToolsNotTruncated(t *testing.T) {
+	cs := connect(t, fixtureStore(t))
+	if out := nomenclatureCall(t, cs, "search_naf", map[string]any{"text": ""}); out.Total != 732 {
+		t.Errorf("search_naf empty: total %d, want 732", out.Total)
+	}
+	if out := nomenclatureCall(t, cs, "search_naf", map[string]any{"text": "", "version": "2025"}); out.Total < 700 {
+		t.Errorf("search_naf 2025 empty: total %d", out.Total)
+	}
+	if out := nomenclatureCall(t, cs, "search_legal_categories", map[string]any{"text": ""}); out.Total != 260 {
+		t.Errorf("search_legal_categories empty: total %d, want 260", out.Total)
+	}
+	if out := nomenclatureCall(t, cs, "search_naf", map[string]any{"text": "commerce"}); out.Total <= 50 {
+		t.Errorf("search_naf commerce: total %d, want > 50", out.Total)
+	}
+	out := nomenclatureCall(t, cs, "search_naf", map[string]any{"text": "kiné"})
+	if out.Total != 1 || out.Entries[0].Code != "86.90E" {
+		t.Errorf("search_naf kiné: %+v", out)
+	}
+}

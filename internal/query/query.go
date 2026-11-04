@@ -333,21 +333,19 @@ func foldCode(s string) string {
 
 // SearchNomenclature returns the entries of table (naf, naf2025,
 // categorie_juridique or tranche_effectifs) whose label contains every word of
-// text, or whose code starts with text, ignoring case, accents, apostrophe
-// style and dots in codes. Empty text lists the table. limit defaults to 50 and
-// is capped at 500.
+// text, whose code starts with text, or (NAF tables) whose curated alias
+// matches text (every word of text starts a word of the alias, e.g. "kiné"
+// finds 86.90E through "kinésithérapeute"). Case, accents, apostrophe style
+// and dots in codes are ignored. Entries keep their official code and label.
+// Empty text lists the whole table. limit <= 0 means no limit: the tables are
+// small (under 800 rows) and the tools must not truncate silently.
 func SearchNomenclature(ctx context.Context, s *store.Store, table, text string, limit int) ([]nomenclature.Entry, error) {
 	if !nomenclatureTables[table] {
 		return nil, fmt.Errorf("nomenclature: unknown table %q, expected naf, naf2025, categorie_juridique or tranche_effectifs", table)
 	}
-	if limit <= 0 {
-		limit = defaultLimit
-	}
-	if limit > maxLimit {
-		limit = maxLimit
-	}
 	words := strings.Fields(foldText(text))
 	code := foldCode(text)
+	aliased := aliasCodes(table, text)
 	out := []nomenclature.Entry{}
 	err := s.Use(ctx, func(db *sql.DB) error {
 		rows, err := db.QueryContext(ctx, "SELECT code, coalesce(libelle,'') FROM "+table+" ORDER BY code") //nolint:gosec // table is checked against nomenclatureTables
@@ -355,12 +353,12 @@ func SearchNomenclature(ctx context.Context, s *store.Store, table, text string,
 			return err
 		}
 		defer rows.Close()
-		for rows.Next() && len(out) < limit {
+		for rows.Next() && (limit <= 0 || len(out) < limit) {
 			var e nomenclature.Entry
 			if err := rows.Scan(&e.Code, &e.Label); err != nil {
 				return err
 			}
-			if matchEntry(e, words, code) {
+			if aliased[e.Code] || matchEntry(e, words, code) {
 				out = append(out, e)
 			}
 		}
@@ -370,6 +368,45 @@ func SearchNomenclature(ctx context.Context, s *store.Store, table, text string,
 		return nil, fmt.Errorf("nomenclature: %w", err)
 	}
 	return out, nil
+}
+
+// aliasWords folds s like foldText and also splits on hyphens, so
+// "masseur-kinésithérapeute" and "expert comptable" compare word by word.
+func aliasWords(s string) []string {
+	return strings.Fields(strings.ReplaceAll(foldText(s), "-", " "))
+}
+
+// aliasCodes returns the codes of table whose curated alias matches text:
+// every word of text is a prefix of some word of the alias.
+func aliasCodes(table, text string) map[string]bool {
+	words := aliasWords(text)
+	if len(words) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, a := range nomenclature.Aliases()[table] {
+		aw := aliasWords(a.Alias)
+		if allPrefixOfSome(words, aw) {
+			out[a.Code] = true
+		}
+	}
+	return out
+}
+
+func allPrefixOfSome(words, of []string) bool {
+	for _, w := range words {
+		found := false
+		for _, o := range of {
+			if strings.HasPrefix(o, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func matchEntry(e nomenclature.Entry, words []string, code string) bool {

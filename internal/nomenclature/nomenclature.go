@@ -18,7 +18,10 @@ import (
 var files embed.FS
 
 // Entry is one nomenclature row.
-type Entry struct{ Code, Label string }
+type Entry struct {
+	Code  string `json:"code"`
+	Label string `json:"label"`
+}
 
 var tables = mustLoad(map[string]string{
 	"naf":                 "data/naf.csv",
@@ -30,22 +33,52 @@ var tables = mustLoad(map[string]string{
 // Tables returns the nomenclatures keyed by DB table name.
 func Tables() map[string][]Entry { return tables }
 
+// Alias maps a common profession or business word (e.g. "kiné", "plombier")
+// to an official code. Aliases are curated hints, not INSEE wording: each one
+// is checked against the official label or INSEE's explanatory notes.
+type Alias struct{ Alias, Code string }
+
+var aliases = mustLoadAliases(map[string]string{
+	"naf":     "data/naf_aliases.csv",
+	"naf2025": "data/naf2025_aliases.csv",
+})
+
+// Aliases returns the curated aliases keyed by DB table name (naf, naf2025).
+func Aliases() map[string][]Alias { return aliases }
+
+func mustLoadAliases(src map[string]string) map[string][]Alias {
+	out := make(map[string][]Alias, len(src))
+	for name, path := range src {
+		recs := mustRead(path, "alias", "code")
+		for _, r := range recs {
+			out[name] = append(out[name], Alias{Alias: r[0], Code: r[1]})
+		}
+	}
+	return out
+}
+
+// mustRead reads an embedded two-column CSV with the given header and returns
+// its data rows.
+func mustRead(path, col1, col2 string) [][]string {
+	f, err := files.Open(path)
+	if err != nil {
+		panic(fmt.Sprintf("nomenclature: %v", err))
+	}
+	recs, err := csv.NewReader(f).ReadAll()
+	_ = f.Close()
+	if err != nil {
+		panic(fmt.Sprintf("nomenclature: %s: %v", path, err))
+	}
+	if len(recs) == 0 || len(recs[0]) != 2 || recs[0][0] != col1 || recs[0][1] != col2 {
+		panic(fmt.Sprintf("nomenclature: %s: header must be %s,%s", path, col1, col2))
+	}
+	return recs[1:]
+}
+
 func mustLoad(src map[string]string) map[string][]Entry {
 	out := make(map[string][]Entry, len(src))
 	for name, path := range src {
-		f, err := files.Open(path)
-		if err != nil {
-			panic(fmt.Sprintf("nomenclature: %v", err))
-		}
-		recs, err := csv.NewReader(f).ReadAll()
-		_ = f.Close()
-		if err != nil {
-			panic(fmt.Sprintf("nomenclature: %s: %v", path, err))
-		}
-		if len(recs) == 0 || len(recs[0]) != 2 || recs[0][0] != "code" || recs[0][1] != "libelle" {
-			panic(fmt.Sprintf("nomenclature: %s: header must be code,libelle", path))
-		}
-		for _, r := range recs[1:] {
+		for _, r := range mustRead(path, "code", "libelle") {
 			out[name] = append(out[name], Entry{Code: r[0], Label: r[1]})
 		}
 	}
