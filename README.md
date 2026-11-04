@@ -17,37 +17,80 @@ authenticated HTTP. One binary, no external service.
 > The stock files come from [data.gouv.fr](https://www.data.gouv.fr). sirene-mcp is an independent
 > project, **not affiliated with or endorsed by INSEE**. The code itself is MIT-licensed.
 
-## Install
-
-Download the archive for your platform from the
-[releases page](https://github.com/Noneo-Code/sirene-mcp/releases) (linux amd64/arm64, macOS arm64),
-check it against `checksums.txt`, and put the binary on your `PATH`:
-
-```bash
-tar -xzf sirene-mcp_darwin_arm64.tar.gz
-mv sirene-mcp ~/.local/bin/
-sirene-mcp version
-```
-
-Linux binaries need glibc 2.35 or newer (Debian 12, Ubuntu 22.04 and later).
-On macOS, the binary is not notarized: if Gatekeeper blocks it, remove the quarantine flag with
-`xattr -d com.apple.quarantine ~/.local/bin/sirene-mcp`.
-
-Or build from source (needs Go and a C toolchain, because DuckDB is linked through CGO):
-
-```bash
-CGO_ENABLED=1 go install github.com/Noneo-Code/sirene-mcp/cmd/sirene-mcp@latest
-```
-
 ## Quick start
 
-```bash
-sirene-mcp sync                       # download the stock files and build the database (once a month)
-sirene-mcp status                     # database location, row counts, last sync
-claude mcp add sirene -- sirene-mcp stdio
+**1. Install.** On macOS (Apple Silicon) or Linux, this downloads the latest release into `~/.local/bin`:
+
+```sh
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/Noneo-Code/sirene-mcp/releases/latest/download/sirene-mcp_${OS}_${ARCH}.tar.gz" \
+  | tar -xz -C ~/.local/bin sirene-mcp
+~/.local/bin/sirene-mcp version
 ```
 
-### Sync
+Prebuilt binaries exist for linux amd64/arm64 and macOS arm64. Linux binaries need glibc 2.35 or
+newer (Debian 12, Ubuntu 22.04 and later).
+
+<details>
+<summary>Other ways: Go, or a manual download</summary>
+
+With Go 1.26+ and a C toolchain (DuckDB is linked through CGO), for instance on an Intel Mac:
+`CGO_ENABLED=1 go install github.com/Noneo-Code/sirene-mcp/cmd/sirene-mcp@latest` (installs to `~/go/bin`).
+
+Or download the archive for your system from the [releases page](https://github.com/Noneo-Code/sirene-mcp/releases)
+and check it against `checksums.txt`. On macOS, a binary downloaded with a browser is
+quarantined: run `xattr -d com.apple.quarantine sirene-mcp` once.
+</details>
+
+**2. Build the database.** This downloads the monthly Sirene stock files (~3 GiB) and builds the
+local database (~10 GiB, a few minutes; see [Sync](#sync) for the requirements):
+
+```sh
+~/.local/bin/sirene-mcp sync
+~/.local/bin/sirene-mcp status   # location, row counts, last sync
+```
+
+Run it again each month (INSEE publishes a new stock at the beginning of the month), or let
+`serve --auto-sync` do it.
+
+**3. Add the server to Claude Code.** Register it with its absolute path, so it works
+whatever your `PATH` is when Claude starts it:
+
+```sh
+claude mcp add sirene --scope user -- ~/.local/bin/sirene-mcp stdio
+claude mcp list   # sirene: ... ✓ Connected
+```
+
+Then restart Claude Code (or run `/mcp`). `--scope user` makes it available in every
+project. To reach a shared server over the network instead, see [Streamable HTTP](#streamable-http).
+
+<details>
+<summary>Claude Desktop, Cursor and other MCP clients</summary>
+
+Add this to the client's `mcpServers` configuration, with the absolute path of the binary
+(`echo ~/.local/bin/sirene-mcp` prints it):
+
+```json
+{
+  "mcpServers": {
+    "sirene": {
+      "command": "/Users/you/.local/bin/sirene-mcp",
+      "args": ["stdio"]
+    }
+  }
+}
+```
+</details>
+
+**4. Ask.** *"How many physiotherapists are there in the Gard?"*, *"Export the active bakeries of
+Montpellier with 10 to 49 employees"*, *"Which legal form and how many establishments does this SIREN have?"*.
+
+To update the binary later, run the install command again; your database is kept.
+
+## Sync
+
 
 `sirene-mcp sync` downloads the *unités légales* and *établissements* stock files, builds a new
 database next to the live one, checks it (row counts against the previous build), then swaps it in
@@ -103,15 +146,13 @@ Each one is a fallback for a flag; a flag given on the command line wins.
 
 ### stdio (local, recommended)
 
+See [Quick start](#quick-start). With a custom data directory:
+
 ```bash
-claude mcp add sirene -- sirene-mcp stdio
-# a custom data directory:
-claude mcp add sirene --env SIRENE_MCP_DATA_DIR=/data/sirene -- sirene-mcp stdio
-claude mcp list   # sirene: ... Connected
+claude mcp add sirene --scope user --env SIRENE_MCP_DATA_DIR=/data/sirene -- ~/.local/bin/sirene-mcp stdio
 ```
 
-Add `--scope user` to make it available in every project. Any MCP client that can launch a
-command works the same way: run `sirene-mcp stdio`.
+Any MCP client that can launch a command works the same way: run `sirene-mcp stdio`.
 
 ### Streamable HTTP
 
