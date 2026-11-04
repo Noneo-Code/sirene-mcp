@@ -1,2 +1,11 @@
 docs/superpowers/
 .superpowers/
+/sirene-mcp
+/dist/
+*.duckdb
+*.duckdb.new
+*.duckdb.wal
+*.parquet
+token
+.DS_Store
+coverage.out
