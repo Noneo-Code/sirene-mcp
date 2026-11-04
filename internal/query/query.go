@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -764,9 +765,18 @@ func firstKeyword(q string) string {
 
 // jsonValue converts a scanned DuckDB value to something encoding/json renders
 // faithfully: times as RFC 3339 strings, bytes as strings, decimals as floats,
-// UUIDs as strings, maps with string keys.
+// UUIDs as strings, maps with string keys, and the non-finite floats JSON
+// cannot hold (NaN, +Inf, -Inf) as the strings "NaN", "Infinity" and
+// "-Infinity", at any depth.
 func jsonValue(v any) any {
 	switch x := v.(type) {
+	case float64:
+		return finite(x)
+	case float32:
+		if math.IsNaN(float64(x)) || math.IsInf(float64(x), 0) {
+			return finite(float64(x))
+		}
+		return x
 	case time.Time:
 		return x.Format(time.RFC3339Nano)
 	case []byte:
@@ -798,7 +808,27 @@ func jsonValue(v any) any {
 			out[fmt.Sprint(jsonValue(k))] = jsonValue(e)
 		}
 		return out
+	case duckdb.OrderedMap:
+		var out duckdb.OrderedMap
+		keys, vals := x.Keys(), x.Values()
+		for i, k := range keys {
+			out.Set(fmt.Sprint(jsonValue(k)), jsonValue(vals[i]))
+		}
+		return out
 	default:
 		return v
 	}
+}
+
+// finite returns f, or its JSON-safe spelling if it is NaN or infinite.
+func finite(f float64) any {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	return f
 }

@@ -338,6 +338,24 @@ func TestRunSQLTrailingSemicolonsAndComments(t *testing.T) {
 	}
 }
 
+func TestRunSQLNonFiniteFloats(t *testing.T) {
+	r, err := RunSQL(context.Background(), testStore(t), `SELECT
+	CAST('NaN' AS DOUBLE) AS nan, 1.0/0 AS inf, CAST('-inf' AS FLOAT) AS ninf, 1.5::FLOAT AS f,
+	[CAST('NaN' AS FLOAT), 2.5] AS l, {'a': -1.0/0} AS s, MAP {'k': 1.0/0} AS m,
+	MAP {DATE '2024-01-02': [CAST('inf' AS DOUBLE)]} AS md`, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(r.Rows)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `[["NaN","Infinity","-Infinity",1.5,["NaN",2.5],{"a":"-Infinity"},{"k":"Infinity"},{"2024-01-02T00:00:00Z":["Infinity"]}]]`
+	if string(b) != want {
+		t.Fatalf("got  %s\nwant %s", b, want)
+	}
+}
+
 func TestRunSQLTimeout(t *testing.T) {
 	_, err := RunSQL(context.Background(), testStore(t),
 		"SELECT count(*) FROM range(100000000000) a", 0, 50*time.Millisecond)

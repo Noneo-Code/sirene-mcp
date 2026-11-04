@@ -130,6 +130,7 @@ func New(s *store.Store, exportDir, version string) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{Name: "sql_query", Annotations: readOnly,
 		Description: "Run a custom SQL query (DuckDB dialect). A single SELECT/WITH statement only, read-only, no file access. " +
 			"max_rows defaults to 1000 and is capped at 10000. " +
+			"Non-finite floats come back as the strings \"NaN\", \"Infinity\" and \"-Infinity\". " +
 			"Tables: unite_legale, etablissement, naf, naf2025, categorie_juridique, tranche_effectifs, sync_log. " +
 			"Prefer the dedicated tools (search_establishments, count_establishments, get_company...) when they fit."}, h.sql)
 	mcp.AddTool(srv, &mcp.Tool{Name: "data_info", Annotations: readOnly,
