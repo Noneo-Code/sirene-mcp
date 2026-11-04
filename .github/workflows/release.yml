@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CGO_ENABLED: "1"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux_amd64
+          - os: ubuntu-24.04-arm
+            target: linux_arm64
+          - os: macos-latest
+            target: darwin_arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o sirene-mcp ./cmd/sirene-mcp
+          tar -czf "sirene-mcp_${{ matrix.target }}.tar.gz" sirene-mcp LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sirene-mcp_${{ matrix.target }}
+          path: sirene-mcp_${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum sirene-mcp_*.tar.gz > checksums.txt
+          gh release create "$GITHUB_REF_NAME" --generate-notes sirene-mcp_*.tar.gz checksums.txt
