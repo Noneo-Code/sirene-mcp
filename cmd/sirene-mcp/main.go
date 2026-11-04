@@ -54,9 +54,10 @@ Usage:
   sirene-mcp sync   [--ul-url URL] [--etab-url URL]  Download the stock files and rebuild the local database
                     [--exclude-closed]               Skip closed establishments and legal units
   sirene-mcp stdio  [--export-dir DIR]               Run the MCP server over stdio
-  sirene-mcp serve  [--http 127.0.0.1:8766]          Run the MCP server over Streamable HTTP (bearer token)
+  sirene-mcp serve  [--addr 127.0.0.1:8766]          Run the MCP server over Streamable HTTP (bearer token)
                     [--allow-remote]                 Allow a non-loopback address (put it behind TLS)
-                    [--auto-sync]                    Refresh the database on a schedule
+                    [--auto-sync]                    Refresh the database monthly (accepts the sync flags)
+                    [--export-dir DIR]
   sirene-mcp token                                   Print the bearer token used by serve
   sirene-mcp status                                  Show the database and last sync
   sirene-mcp version
@@ -89,6 +90,10 @@ func run(args []string) error {
 		return runSync(args[1:])
 	case "stdio":
 		return runStdio(args[1:])
+	case "serve":
+		return runServe(args[1:])
+	case "token":
+		return runToken(args[1:])
 	case "status":
 		return runStatus(args[1:])
 	case "help", "--help", "-h":
@@ -142,13 +147,18 @@ func parse(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
-func runSync(args []string) error {
-	fs, c := newFlags("sync")
-	var o syncer.Options
+// syncFlags registers the sync options shared by `sync` and `serve --auto-sync`.
+func syncFlags(fs *flag.FlagSet, o *syncer.Options) {
 	fs.StringVar(&o.ULURL, "ul-url", envOr("SIRENE_MCP_UL_URL", defaultULURL), "unite legale stock URL ($SIRENE_MCP_UL_URL)")
 	fs.StringVar(&o.EtabURL, "etab-url", envOr("SIRENE_MCP_ETAB_URL", defaultEtabURL), "etablissement stock URL ($SIRENE_MCP_ETAB_URL)")
 	fs.BoolVar(&o.ExcludeClosed, "exclude-closed", false, "skip closed establishments and legal units")
 	fs.StringVar(&o.MemoryLimit, "memory-limit", "4GB", "DuckDB memory limit for the build")
+}
+
+func runSync(args []string) error {
+	fs, c := newFlags("sync")
+	var o syncer.Options
+	syncFlags(fs, &o)
 	fs.BoolVar(&o.KeepDownloads, "keep-downloads", false, "keep the downloaded Parquet files")
 	if err := parse(fs, args); err != nil {
 		return err
