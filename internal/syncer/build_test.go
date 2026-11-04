@@ -230,3 +230,20 @@ func TestBuildRemovesOutOnError(t *testing.T) {
 		t.Fatalf("output left behind: %v", statErr)
 	}
 }
+
+func TestBuildFoldsLigaturesInNomRecherche(t *testing.T) {
+	ul, etab := sirenetest.Default()
+	etab = append(etab, sirenetest.Etab{
+		"siren": "111111111", "nic": "00045", "siret": "11111111100045", "statutDiffusionEtablissement": "O",
+		"etablissementSiege": "false", "codeCommuneEtablissement": "30189", "codePostalEtablissement": "30000",
+		"etatAdministratifEtablissement": "A", "activitePrincipaleEtablissement": "86.90E",
+		"enseigne1Etablissement": "CŒUR ÆLIA",
+	})
+	_, out := build(t, ul, etab, false)
+	db := openRO(t, out)
+	var nom string
+	queryRow(t, db, "SELECT nom_recherche FROM etablissement WHERE siret = ?", []any{"11111111100045"}, &nom)
+	if !strings.Contains(nom, "coeur aelia") {
+		t.Errorf("nom_recherche = %q, want ligatures folded (coeur aelia)", nom)
+	}
+}

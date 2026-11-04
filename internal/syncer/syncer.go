@@ -113,10 +113,16 @@ func Run(ctx context.Context, p config.Paths, client *http.Client, o Options, lo
 	return stats, nil
 }
 
-// checkRatio compares the new counts with the live database's last sync_log
-// row. An unreadable or missing previous database is not an obstacle: the new
-// one may be the repair.
+// checkRatio rejects an empty table outright, then compares the new counts
+// with the live database's last sync_log row. An unreadable or missing previous
+// database is not an obstacle to the ratio check (the new one may be the
+// repair), and a change of exclude_closed mode skips it, but neither excuses
+// an empty table.
 func checkRatio(dbPath string, got BuildStats, o Options, log *slog.Logger) error {
+	if got.ULRows == 0 || got.EtabRows == 0 {
+		return fmt.Errorf("new database rejected: empty table (unite_legale %d rows, etablissement %d rows); live database left untouched",
+			got.ULRows, got.EtabRows)
+	}
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil
 	}

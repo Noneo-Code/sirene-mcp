@@ -233,7 +233,9 @@ SELECT
 	nullif(concat_ws(' ', numero_voie, indice_repetition, type_voie, libelle_voie, complement_adresse,
 		code_postal, coalesce(libelle_commune, libelle_commune_etranger), libelle_pays_etranger), '') AS adresse_complete,
 	nom_affiche,
-	strip_accents(lower(concat_ws(' ', nom_affiche, ul_sigle, ul_denomination))) AS nom_recherche,
+	-- strip_accents keeps the ligatures; fold them like the query side does.
+	replace(replace(strip_accents(lower(concat_ws(' ', nom_affiche, ul_sigle, ul_denomination))),
+		'œ', 'oe'), 'æ', 'ae') AS nom_recherche,
 	categorie_juridique,
 	categorie_entreprise
 FROM n
