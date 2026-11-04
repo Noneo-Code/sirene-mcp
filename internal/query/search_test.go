@@ -76,6 +76,19 @@ func TestSearchByName(t *testing.T) {
 	}
 }
 
+func TestSearchNameWildcardsAreLiteral(t *testing.T) {
+	s := testStore(t)
+	for _, name := range []string{"%", "_", "e%g"} {
+		r, err := Search(context.Background(), s, Filters{Name: name, Etat: "all"}, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Total != 0 {
+			t.Errorf("name %q matched %d rows, want 0 (wildcards must be literal)", name, r.Total)
+		}
+	}
+}
+
 func TestSearchCapsButReportsTotal(t *testing.T) {
 	s := testStore(t)
 	r, err := Search(context.Background(), s, Filters{}, 2, 0)

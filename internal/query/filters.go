@@ -42,6 +42,14 @@ func normalizeDepartement(s string) string {
 	if len(s) == 3 && s[0] == '0' && strings.Trim(s, "0123456789") == "" {
 		s = s[1:]
 	}
+	return padDigit(s)
+}
+
+// padDigit turns a single digit into its 2-digit code ("1" -> "01").
+func padDigit(s string) string {
+	if len(s) == 1 && s[0] >= '0' && s[0] <= '9' {
+		return "0" + s
+	}
 	return s
 }
 
@@ -99,7 +107,7 @@ func (f Filters) Where() (string, []any, error) {
 	exact("e.departement", mapAll(f.Departements, normalizeDepartement))
 	exact("e.code_commune", trimAll(f.Communes))
 	exact("e.code_postal", trimAll(f.CodesPostaux))
-	exact("e.tranche_effectifs", trimAll(f.Tranches))
+	exact("e.tranche_effectifs", mapAll(f.Tranches, padDigit))
 	prefix("e.categorie_juridique", trimAll(f.CategoriesJuridiques))
 
 	for _, d := range []struct{ field, val, op string }{
@@ -130,8 +138,8 @@ func (f Filters) Where() (string, []any, error) {
 		return "", nil, fmt.Errorf("etat: unknown value %q, expected A, F or all", f.Etat)
 	}
 	if n := normalizeName(f.Name); n != "" {
-		conds = append(conds, "e.nom_recherche LIKE '%' || strip_accents(lower(?)) || '%'")
-		args = append(args, n)
+		conds = append(conds, `e.nom_recherche LIKE '%' || strip_accents(lower(?)) || '%' ESCAPE '\'`)
+		args = append(args, escapeLike(n))
 	}
 
 	if len(conds) == 0 {
