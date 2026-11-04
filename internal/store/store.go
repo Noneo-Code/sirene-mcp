@@ -36,19 +36,43 @@ type Options struct {
 
 // Store is a lazily opened, read-only handle on the database file. It is safe
 // for concurrent use.
+//
+// The pools opened on one version of the file form a generation. Each Use
+// takes a reference on the current generation's pool and drops it when fn
+// returns; a swap of the file publishes a new generation without waiting and
+// closes the old pools once their last user is done. The mutex is only held to
+// take or drop references and to publish a generation, never while fn runs or
+// while pools open, so no caller waits on another's query.
 type Store struct {
 	path    string
 	opts    Options
 	syncing atomic.Bool
 
-	mu     sync.RWMutex
+	mu      sync.Mutex
+	cur     *generation   // nil until first use, after a removal or a failed rebuild
+	opening chan struct{} // non-nil while a caller opens a generation; closed when done
+	closed  bool
+
+	// beforeOpen, if set, runs before a generation opens (tests).
+	beforeOpen func()
+}
+
+// generation is the pair of pools opened on one version of the file.
+type generation struct {
 	info   os.FileInfo // identity of the file the pools were opened on
-	main   *sql.DB
-	locked *sql.DB
-	// lockedPath is the path DuckDB reports for the file attached in the locked
-	// instance; the health check compares against it.
-	lockedPath string
-	closed     bool
+	main   *pool
+	locked *pool // replaced in place by rebuildLocked
+}
+
+// pool is a reference-counted *sql.DB. refs and retired are guarded by
+// Store.mu; the DB is closed when it is retired and unused.
+type pool struct {
+	db *sql.DB
+	// path is, for a locked pool, the path DuckDB reports for the attached
+	// file; the health check compares against it.
+	path    string
+	refs    int
+	retired bool
 }
 
 // Open returns a Store for path with default Options. It never fails: the
@@ -64,10 +88,10 @@ func (s *Store) SetSyncing(v bool) { s.syncing.Store(v) }
 
 // Use runs fn with the main read-only pool.
 //
-// fn runs under the store's read lock, which a swap of the database file waits
-// for: Use and UseLocked are not reentrant (never call either from inside fn,
-// a pending swap would deadlock them), and a long fn delays swaps for every
-// other caller.
+// fn keeps the pool it was given even if the file is swapped meanwhile: the
+// old pools stay open until their last user returns, while later calls get
+// pools on the new file. The only wait, for another caller opening the pools,
+// ends early with ctx.Err() if ctx is done.
 func (s *Store) Use(ctx context.Context, fn func(db *sql.DB) error) error {
 	return s.use(ctx, false, fn)
 }
@@ -77,17 +101,16 @@ func (s *Store) Use(ctx context.Context, fn func(db *sql.DB) error) error {
 // ':memory:', CREATE TABLE in the memory catalog…), the next call gets a clean
 // pool: connections are never reused, and after fn a health check rebuilds the
 // locked instance if it was altered. Calls running concurrently with a hostile
-// fn may still see its effects. Like Use, it is not reentrant and a long fn
-// delays swaps.
+// fn may still see its effects.
 func (s *Store) UseLocked(ctx context.Context, fn func(db *sql.DB) error) error {
 	return s.use(ctx, true, fn)
 }
 
 func (s *Store) use(ctx context.Context, locked bool, fn func(db *sql.DB) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fi, err := s.stat()
 		if errors.Is(err, ErrNoDatabase) {
 			s.dropPools() // release the handle on the deleted file
@@ -98,32 +121,97 @@ func (s *Store) use(ctx context.Context, locked bool, fn func(db *sql.DB) error)
 		if err != nil {
 			return err
 		}
-		s.mu.RLock()
-		if s.closed {
-			s.mu.RUnlock()
-			return errors.New("store: closed")
+		g, p, wait, err := s.acquire(fi, locked)
+		if err != nil {
+			return err
 		}
-		if s.info != nil && sameFile(s.info, fi) {
-			db := s.main
-			if locked {
-				db = s.locked
-			}
-			if !locked {
-				defer s.mu.RUnlock()
-				return fn(db)
-			}
-			err := fn(db)
-			healthy := lockedHealthy(db, s.lockedPath)
-			s.mu.RUnlock()
+		if p != nil {
+			err := fn(p.db)
+			healthy := !locked || lockedHealthy(p.db, p.path)
+			s.release(p)
 			if !healthy {
-				s.rebuildLocked(db)
+				s.rebuildLocked(g, p)
 			}
 			return err
 		}
-		s.mu.RUnlock()
-		if err := s.reopen(fi); err != nil {
+		if wait != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-wait:
+			}
+			continue
+		}
+		if err := s.reopen(ctx, fi); err != nil {
 			return err
 		}
+	}
+}
+
+// acquire takes a reference on the current generation's main or locked pool
+// if it was opened on the file described by fi. Otherwise it returns the
+// channel of an opening in progress to wait on, or, with all three results
+// nil, makes the caller the opener: it must call reopen.
+func (s *Store) acquire(fi os.FileInfo, locked bool) (*generation, *pool, <-chan struct{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, nil, errors.New("store: closed")
+	}
+	if g := s.cur; g != nil && sameFile(g.info, fi) {
+		p := g.main
+		if locked {
+			p = g.locked
+		}
+		p.refs++
+		return g, p, nil, nil
+	}
+	if s.opening != nil {
+		return nil, nil, s.opening, nil
+	}
+	s.opening = make(chan struct{})
+	return nil, nil, nil, nil
+}
+
+// release drops a reference taken by acquire.
+func (s *Store) release(p *pool) {
+	s.mu.Lock()
+	p.refs--
+	closeNow := p.retired && p.refs == 0
+	s.mu.Unlock()
+	if closeNow {
+		_ = p.db.Close()
+	}
+}
+
+// retire marks p for closing and returns whether it is unused, in which case
+// the caller closes it once s.mu is released. Called with s.mu held.
+func retire(p *pool) bool {
+	if p == nil || p.retired {
+		return false
+	}
+	p.retired = true
+	return p.refs == 0
+}
+
+// retireGen retires both pools of g and returns those to close now. Called
+// with s.mu held.
+func retireGen(g *generation) []*pool {
+	if g == nil {
+		return nil
+	}
+	var out []*pool
+	for _, p := range []*pool{g.main, g.locked} {
+		if retire(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func closePools(ps []*pool) {
+	for _, p := range ps {
+		_ = p.db.Close()
 	}
 }
 
@@ -142,29 +230,43 @@ func sameFile(a, b os.FileInfo) bool {
 	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
-// reopen swaps the pools for ones opened on the file described by fi, unless
-// another caller already did. It waits for in-flight users of the old pools.
-func (s *Store) reopen(fi os.FileInfo) error {
+// reopen opens a generation on the file described by fi and publishes it,
+// retiring the previous one without waiting for its users. Only the caller
+// that acquire made the opener calls it; it ends the opening either way.
+func (s *Store) reopen(ctx context.Context, fi os.FileInfo) error {
+	if s.beforeOpen != nil {
+		s.beforeOpen()
+	}
+	g, err := s.openGeneration(ctx, fi)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("store: closed")
+	close(s.opening)
+	s.opening = nil
+	var toClose []*pool
+	switch {
+	case err != nil:
+	case s.closed:
+		toClose = []*pool{g.main, g.locked}
+		err = errors.New("store: closed")
+	default:
+		toClose = retireGen(s.cur)
+		s.cur = g
 	}
-	if s.info != nil && sameFile(s.info, fi) {
-		return nil
-	}
-	s.closePools()
-	main, err := openPool(s.path, s.mainSettings())
+	s.mu.Unlock()
+	closePools(toClose)
+	return err
+}
+
+func (s *Store) openGeneration(ctx context.Context, fi os.FileInfo) (*generation, error) {
+	main, err := openPool(ctx, s.path, s.mainSettings())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	locked, lockedPath, err := openLocked(s.path)
+	locked, err := openLocked(ctx, s.path)
 	if err != nil {
 		_ = main.Close()
-		return err
+		return nil, err
 	}
-	s.main, s.locked, s.lockedPath, s.info = main, locked, lockedPath, fi
-	return nil
+	return &generation{info: fi, main: &pool{db: main}, locked: locked}, nil
 }
 
 // mainSettings are applied once per main instance.
@@ -186,22 +288,22 @@ var lockedSettings = []string{
 	"SET lock_configuration=true",
 }
 
-// openLocked opens the locked pool and returns the attached file's path as
+// openLocked opens the locked pool and records the attached file's path as
 // DuckDB reports it.
-func openLocked(path string) (*sql.DB, string, error) {
-	db, err := openPool(path, lockedSettings)
+func openLocked(ctx context.Context, path string) (*pool, error) {
+	db, err := openPool(ctx, path, lockedSettings)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	// No idle connections: per-connection state (USE, temp tables) dies with
 	// the connection, and every connection starts with USE sirene.
 	db.SetMaxIdleConns(0)
 	var attached string
-	if err := db.QueryRow("SELECT path FROM duckdb_databases() WHERE database_name = 'sirene'").Scan(&attached); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT path FROM duckdb_databases() WHERE database_name = 'sirene'").Scan(&attached); err != nil {
 		_ = db.Close()
-		return nil, "", fmt.Errorf("store: open %s: %w", path, err)
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
-	return db, attached, nil
+	return &pool{db: db, path: attached}, nil
 }
 
 // lockedHealthy reports whether the locked instance is still exactly as opened:
@@ -220,24 +322,32 @@ func lockedHealthy(db *sql.DB, attached string) bool {
 	return err == nil && ok
 }
 
-// rebuildLocked replaces the locked pool bad with a fresh one, unless another
-// caller already did. The main pool is not touched.
-func (s *Store) rebuildLocked(bad *sql.DB) {
+// rebuildLocked replaces g's locked pool bad with a fresh one, unless another
+// caller already did or g is no longer current. The main pool is not touched,
+// and users still holding bad keep it until they return.
+func (s *Store) rebuildLocked(g *generation, bad *pool) {
+	fresh, err := openLocked(context.Background(), s.path)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || s.locked != bad {
-		return
+	var toClose []*pool
+	switch {
+	case s.closed || s.cur != g || g.locked != bad:
+		if fresh != nil {
+			toClose = []*pool{fresh}
+		}
+	case err != nil:
+		// The next call reopens everything or reports ErrNoDatabase.
+		toClose = retireGen(g)
+		s.cur = nil
+	default:
+		// If the file was swapped meanwhile, the next call sees the identity
+		// change and opens a new generation.
+		if retire(bad) {
+			toClose = []*pool{bad}
+		}
+		g.locked = fresh
 	}
-	_ = bad.Close()
-	s.locked = nil
-	db, attached, err := openLocked(s.path)
-	if err != nil {
-		s.closePools() // the next call reopens everything or reports ErrNoDatabase
-		return
-	}
-	// If the file was swapped meanwhile, the next call sees the identity change
-	// and reopens both pools.
-	s.locked, s.lockedPath = db, attached
+	s.mu.Unlock()
+	closePools(toClose)
 }
 
 func quote(v string) string { return "'" + strings.ReplaceAll(v, "'", "''") + "'" }
@@ -248,7 +358,7 @@ func quote(v string) string { return "'" + strings.ReplaceAll(v, "'", "''") + "'
 // so the locked pool's global settings (enable_external_access,
 // lock_configuration) would leak into the main pool, and a reopen while another
 // handle on the same path is alive would get the old file back.
-func openPool(path string, settings []string) (*sql.DB, error) {
+func openPool(ctx context.Context, path string, settings []string) (*sql.DB, error) {
 	var ready atomic.Bool
 	c, err := duckdb.NewConnector(":memory:", func(execer driver.ExecerContext) error {
 		if !ready.Load() {
@@ -260,7 +370,7 @@ func openPool(path string, settings []string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
-	if err := setup(c, path, settings); err != nil {
+	if err := setup(ctx, c, path, settings); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -272,8 +382,7 @@ func openPool(path string, settings []string) (*sql.DB, error) {
 
 // setup attaches the file and applies instance-wide settings, on a connection
 // of its own before the pool hands any out.
-func setup(c *duckdb.Connector, path string, settings []string) error {
-	ctx := context.Background()
+func setup(ctx context.Context, c *duckdb.Connector, path string, settings []string) error {
 	conn, err := c.Connect(ctx)
 	if err != nil {
 		return fmt.Errorf("store: open %s: %w", path, err)
@@ -299,36 +408,29 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// dropPools closes the pools, if any, once in-flight users are done.
+// dropPools retires the current generation, if the file is gone. Its pools
+// close once their in-flight users are done.
 func (s *Store) dropPools() {
-	s.mu.RLock()
-	open := s.info != nil
-	s.mu.RUnlock()
-	if !open {
-		return
-	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
-		s.closePools()
+	var toClose []*pool
+	if s.cur != nil {
+		if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
+			toClose = retireGen(s.cur)
+			s.cur = nil
+		}
 	}
+	s.mu.Unlock()
+	closePools(toClose)
 }
 
-func (s *Store) closePools() {
-	if s.main != nil {
-		_ = s.main.Close()
-	}
-	if s.locked != nil {
-		_ = s.locked.Close()
-	}
-	s.main, s.locked, s.lockedPath, s.info = nil, nil, "", nil
-}
-
-// Close closes the pools. Later calls to Use fail.
+// Close retires the pools without waiting: those in use close when their last
+// user returns. Later calls to Use fail.
 func (s *Store) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closePools()
+	toClose := retireGen(s.cur)
+	s.cur = nil
 	s.closed = true
+	s.mu.Unlock()
+	closePools(toClose)
 	return nil
 }

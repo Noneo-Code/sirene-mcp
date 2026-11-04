@@ -166,7 +166,8 @@ func TestInFlightQuerySurvivesSwap(t *testing.T) {
 	<-started
 	place(t, b, path)
 
-	// The next Use must wait for the in-flight one, then see B.
+	// The next Use must not wait for the in-flight one: it gets pools on B
+	// while the in-flight Use keeps A.
 	next := make(chan int64, 1)
 	go func() {
 		var n int64
@@ -179,15 +180,123 @@ func TestInFlightQuerySurvivesSwap(t *testing.T) {
 	}()
 	select {
 	case n := <-next:
-		t.Fatalf("Use returned %d while a user still held the old pools", n)
-	case <-time.After(200 * time.Millisecond):
+		if n != 6 {
+			t.Fatalf("count after swap = %d, want 6", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Use blocked behind an in-flight user of the old pools")
+	}
+	// UseLocked does not wait either.
+	var n int64
+	if err := s.UseLocked(context.Background(), func(db *sql.DB) error {
+		return db.QueryRow("SELECT count(*) FROM unite_legale").Scan(&n)
+	}); err != nil || n != 6 {
+		t.Fatalf("UseLocked after swap = %d, %v; want 6", n, err)
 	}
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("in-flight Use: %v", err)
 	}
-	if n := <-next; n != 6 {
+}
+
+// TestOldGenerationClosesAfterLastUser checks that a swap retires the old
+// pools and that they close once their in-flight user returns, not before.
+func TestOldGenerationClosesAfterLastUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	b := dbB(t)
+	s := openStore(t, path)
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var old *sql.DB
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Use(context.Background(), func(db *sql.DB) error {
+			old = db
+			close(started)
+			<-release
+			return db.Ping()
+		})
+	}()
+	<-started
+	place(t, b, path)
+	if n := countUL(t, s); n != 6 {
 		t.Fatalf("count after swap = %d, want 6", n)
+	}
+	if err := old.Ping(); err != nil {
+		t.Fatalf("old pool closed while in use: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("in-flight Use: %v", err)
+	}
+	if err := old.Ping(); err == nil {
+		t.Fatal("old pool still open after its last user returned")
+	}
+}
+
+// TestWaitForOpenHonoursContext checks the one remaining wait: a caller that
+// finds another one opening the pools gives up when its context is done.
+func TestWaitForOpenHonoursContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	s := openStore(t, path)
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	s.beforeOpen = func() { close(entered); <-unblock }
+
+	opener := make(chan error, 1)
+	go func() { opener <- s.Use(context.Background(), func(*sql.DB) error { return nil }) }()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiter := make(chan error, 1)
+	go func() { waiter <- s.Use(ctx, func(*sql.DB) error { return nil }) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-waiter:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiter err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting Use ignored its cancelled context")
+	}
+	close(unblock)
+	if err := <-opener; err != nil {
+		t.Fatalf("opener: %v", err)
+	}
+}
+
+// TestCloseDoesNotWaitForUsers checks that Close returns while a Use is in
+// flight, which keeps its pool until it returns.
+func TestCloseDoesNotWaitForUsers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	s := Open(path)
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Use(context.Background(), func(db *sql.DB) error {
+			close(started)
+			<-release
+			var n int64
+			return db.QueryRow("SELECT count(*) FROM unite_legale").Scan(&n)
+		})
+	}()
+	<-started
+	closed := make(chan struct{})
+	go func() { _ = s.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for an in-flight Use")
+	}
+	if err := s.Use(context.Background(), func(*sql.DB) error { return nil }); err == nil {
+		t.Fatal("Use after Close succeeded")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("in-flight Use after Close: %v", err)
 	}
 }
 
@@ -380,8 +489,8 @@ func TestLockedPoolNotRebuiltWhenHealthy(t *testing.T) {
 		t.Fatalf("memory_limit = %q, %v", limit, err)
 	}
 	t.Logf("locked memory_limit = %s", limit)
-	first := s.locked
-	if !lockedHealthy(first, s.lockedPath) {
+	first := s.cur.locked
+	if !lockedHealthy(first.db, first.path) {
 		t.Fatal("fresh locked pool reported unhealthy")
 	}
 	for range 3 {
@@ -389,12 +498,18 @@ func TestLockedPoolNotRebuiltWhenHealthy(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if s.locked != first {
+	if s.cur.locked != first {
 		t.Fatal("healthy locked pool was rebuilt")
 	}
 	_ = s.UseLocked(ctx, func(db *sql.DB) error { _, err := db.Exec("USE memory; DETACH sirene"); return err })
-	if s.locked == first {
+	if s.cur.locked == first {
 		t.Fatal("broken locked pool was not rebuilt")
+	}
+	if !first.retired || first.refs != 0 {
+		t.Fatalf("broken pool retired=%v refs=%d", first.retired, first.refs)
+	}
+	if err := first.db.Ping(); err == nil {
+		t.Fatal("broken locked pool left open")
 	}
 }
 
