@@ -283,6 +283,61 @@ func TestRunSQLTruncates(t *testing.T) {
 	}
 }
 
+// TestRunSQLBoundsInDatabase checks that the row cap reaches DuckDB: without
+// it the driver would materialize ten billion rows before the first Scan.
+func TestRunSQLBoundsInDatabase(t *testing.T) {
+	r, err := RunSQL(context.Background(), testStore(t), "SELECT * FROM range(10000000000)", 5, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 5 || !r.Truncated {
+		t.Fatalf("rows=%d truncated=%v", len(r.Rows), r.Truncated)
+	}
+}
+
+func TestRunSQLExactlyMaxRowsNotTruncated(t *testing.T) {
+	r, err := RunSQL(context.Background(), testStore(t), "SELECT * FROM range(3)", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 3 || r.Truncated {
+		t.Fatalf("rows=%d truncated=%v", len(r.Rows), r.Truncated)
+	}
+}
+
+func TestRunSQLKeepsOrderUnderBound(t *testing.T) {
+	r, err := RunSQL(context.Background(), testStore(t),
+		"SELECT x FROM range(100000) t(x) ORDER BY x DESC", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int64
+	for _, row := range r.Rows {
+		got = append(got, row[0].(int64))
+	}
+	if len(got) != 3 || got[0] != 99999 || got[1] != 99998 || got[2] != 99997 || !r.Truncated {
+		t.Fatalf("got %v truncated=%v", got, r.Truncated)
+	}
+}
+
+func TestRunSQLTrailingSemicolonsAndComments(t *testing.T) {
+	s := testStore(t)
+	for _, q := range []string{
+		"SELECT 42 AS n;", "SELECT 42 AS n ; \n", "SELECT 42 AS n -- trailing", "SELECT 42 AS n; -- done",
+		"SELECT 42 AS n /* c */;", "/* lead */ SELECT 42 AS n",
+		"WITH a AS (SELECT 42 AS n) SELECT * FROM a;", "SELECT 42 AS n UNION ALL SELECT 42 AS n ORDER BY n LIMIT 1",
+	} {
+		r, err := RunSQL(context.Background(), s, q, 0, 0)
+		if err != nil {
+			t.Errorf("%q: %v", q, err)
+			continue
+		}
+		if len(r.Rows) != 1 || r.Rows[0][0] != int32(42) || r.Columns[0] != "n" {
+			t.Errorf("%q: got %+v", q, r)
+		}
+	}
+}
+
 func TestRunSQLTimeout(t *testing.T) {
 	_, err := RunSQL(context.Background(), testStore(t),
 		"SELECT count(*) FROM range(100000000000) a", 0, 50*time.Millisecond)

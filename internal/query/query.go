@@ -568,6 +568,9 @@ type SQLResult struct {
 // tree walk. The READ_ONLY attach of the file is a second layer, and table
 // functions reading files are stopped at execution by
 // enable_external_access=false.
+//
+// The validated query then runs wrapped in SELECT * FROM (…) LIMIT maxRows+1
+// (see boundQuery), so DuckDB never builds more rows than the page needs.
 func RunSQL(ctx context.Context, s *store.Store, query string, maxRows int, timeout time.Duration) (SQLResult, error) {
 	if maxRows <= 0 {
 		maxRows = defaultSQLRows
@@ -588,7 +591,11 @@ func RunSQL(ctx context.Context, s *store.Store, query string, maxRows int, time
 		if err := checkSelect(ctx, db, query); err != nil {
 			return err
 		}
-		rows, err := db.QueryContext(ctx, query)
+		bounded, err := boundQuery(ctx, db, query, maxRows+1)
+		if err != nil {
+			return err
+		}
+		rows, err := db.QueryContext(ctx, bounded)
 		if err != nil {
 			return err
 		}
@@ -623,6 +630,39 @@ func RunSQL(ctx context.Context, s *store.Store, query string, maxRows int, time
 		return SQLResult{}, fmt.Errorf("sql: %w", err)
 	}
 	return res, nil
+}
+
+// boundQuery wraps the validated query so that DuckDB itself stops after limit
+// rows: the driver materializes a whole result before QueryContext returns, so
+// a bound applied while scanning would not stop SELECT * FROM etablissement
+// from building tens of millions of rows. The extra row past maxRows tells
+// RunSQL the result was truncated. DuckDB keeps the inner ORDER BY under the
+// outer LIMIT (it plans the pair as a top-N).
+//
+// The query goes in verbatim, after its trailing semicolons and whitespace,
+// on lines of its own so a trailing -- comment cannot swallow the closing
+// parenthesis. If that text does not wrap into a single read-only statement
+// (say "SELECT 1; -- done"), DuckDB's own rendering of the parsed statement
+// (json_deserialize_sql) is wrapped instead. Either way the wrapped text goes
+// through checkSelect again before it runs.
+func boundQuery(ctx context.Context, db *sql.DB, query string, limit int) (string, error) {
+	wrap := func(q string) string {
+		q = strings.TrimRight(q, " \t\r\n\f;")
+		return fmt.Sprintf("SELECT * FROM (\n%s\n) AS q LIMIT %d", q, limit)
+	}
+	w := wrap(query)
+	if checkSelect(ctx, db, w) == nil {
+		return w, nil
+	}
+	var canon string
+	if err := db.QueryRowContext(ctx, "SELECT json_deserialize_sql(json_serialize_sql(?))", query).Scan(&canon); err != nil {
+		return "", err
+	}
+	w = wrap(canon)
+	if err := checkSelect(ctx, db, w); err != nil {
+		return "", err
+	}
+	return w, nil
 }
 
 // checkSelect parses query with DuckDB and requires exactly one SELECT statement.
