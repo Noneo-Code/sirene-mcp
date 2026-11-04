@@ -31,7 +31,9 @@ curl -fsSL "https://github.com/Noneo-Code/sirene-mcp/releases/latest/download/si
 ```
 
 Prebuilt binaries exist for linux amd64/arm64 and macOS arm64. Linux binaries need glibc 2.35 or
-newer (Debian 12, Ubuntu 22.04 and later).
+newer (Debian 12, Ubuntu 22.04 and later). The macOS archive is built on a GitHub-hosted macOS
+runner and can be added to a release a little after it is published; if it is missing, install
+with Go (below).
 
 <details>
 <summary>Other ways: Go, or a manual download</summary>

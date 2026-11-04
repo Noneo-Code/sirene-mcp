@@ -11,21 +11,19 @@ env:
   CGO_ENABLED: "1"
 
 jobs:
-  build:
+  # Linux binaries gate the release. They link against the runner's glibc:
+  # 22.04 (glibc 2.35) keeps them runnable on Debian 12, Ubuntu 22.04 and newer.
+  build-linux:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
       matrix:
-        # Linux binaries link against the runner's glibc: 22.04 (glibc 2.35)
-        # keeps them runnable on Debian 12, Ubuntu 22.04 and newer.
         include:
           - os: ubuntu-22.04
             target: linux_amd64
           - os: ubuntu-22.04-arm
             target: linux_arm64
-          - os: macos-latest
-            target: darwin_arm64
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -37,9 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o sirene-mcp ./cmd/sirene-mcp
-          if [ "$RUNNER_OS" = Linux ]; then
-            echo "newest glibc symbol required: $(objdump -T sirene-mcp | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
-          fi
+          echo "newest glibc symbol required: $(objdump -T sirene-mcp | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
           tar -czf "sirene-mcp_${{ matrix.target }}.tar.gz" sirene-mcp LICENSE README.md
       - uses: actions/upload-artifact@v4
         with:
@@ -48,7 +44,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: build-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -65,3 +61,40 @@ jobs:
           cd dist
           sha256sum sirene-mcp_*.tar.gz > checksums.txt
           gh release create "$GITHUB_REF_NAME" --generate-notes sirene-mcp_*.tar.gz checksums.txt
+
+  # Optional: macOS runners can wait a long time on the free plan. The release
+  # never waits for this job; when a runner does pick it up, the macOS archive
+  # is added to the existing release and checksums.txt is updated.
+  build-macos:
+    name: Build (darwin_arm64, optional)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o sirene-mcp ./cmd/sirene-mcp
+          tar -czf sirene-mcp_darwin_arm64.tar.gz sirene-mcp LICENSE README.md
+      - name: Add to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The release job may still be running: wait for the release (up to 30 min).
+          for _ in $(seq 1 60); do
+            gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && break
+            sleep 30
+          done
+          gh release view "$GITHUB_REF_NAME" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" sirene-mcp_darwin_arm64.tar.gz --clobber
+          mkdir dist
+          gh release download "$GITHUB_REF_NAME" --pattern 'sirene-mcp_*.tar.gz' --dir dist
+          (cd dist && shasum -a 256 sirene-mcp_*.tar.gz > checksums.txt)
+          gh release upload "$GITHUB_REF_NAME" dist/checksums.txt --clobber
