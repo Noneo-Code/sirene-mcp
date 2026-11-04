@@ -285,3 +285,115 @@ func TestLockedPoolBlocksFiles(t *testing.T) {
 		t.Fatal("main pool accepted a write")
 	}
 }
+
+func fileState(t *testing.T, path string) (os.FileInfo, []byte) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi, data
+}
+
+// lockedRecovers runs each hostile statement on the locked pool, then checks
+// that the locked pool (on fresh and reused connections) and the main pool still
+// see the untouched database.
+func lockedRecovers(t *testing.T, hostile ...string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	s := openStore(t, path)
+	ctx := context.Background()
+	countUL(t, s)
+	fi, data := fileState(t, path)
+
+	for _, q := range hostile {
+		_ = s.UseLocked(ctx, func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, q)
+			return err
+		})
+		for i := range 3 {
+			var n int64
+			err := s.UseLocked(ctx, func(db *sql.DB) error {
+				return db.QueryRow("SELECT count(*) FROM unite_legale").Scan(&n)
+			})
+			if err != nil || n != 5 {
+				t.Fatalf("after %q, UseLocked #%d = %d, %v; want 5", q, i, n, err)
+			}
+		}
+		var leftovers int64
+		if err := s.UseLocked(ctx, func(db *sql.DB) error {
+			return db.QueryRow("SELECT count(*) FROM duckdb_tables() WHERE database_name <> 'sirene'").Scan(&leftovers)
+		}); err != nil || leftovers != 0 {
+			t.Fatalf("after %q, tables outside sirene = %d, %v", q, leftovers, err)
+		}
+		if n := countUL(t, s); n != 5 {
+			t.Fatalf("after %q, main pool count = %d", q, n)
+		}
+	}
+	fi2, data2 := fileState(t, path)
+	if !sameFile(fi, fi2) || string(data) != string(data2) {
+		t.Fatal("database file changed")
+	}
+}
+
+func TestLockedPoolRecoversFromUse(t *testing.T) {
+	lockedRecovers(t, "USE memory", "USE system")
+}
+
+func TestLockedPoolRecoversFromDetach(t *testing.T) {
+	lockedRecovers(t,
+		"USE memory; DETACH sirene",
+		"USE memory; DETACH DATABASE IF EXISTS sirene; ATTACH ':memory:' AS sirene",
+	)
+}
+
+func TestLockedPoolRecoversFromLeftovers(t *testing.T) {
+	lockedRecovers(t,
+		"CREATE TABLE memory.main.t AS SELECT * FROM range(1000)",
+		"ATTACH ':memory:' AS x; CREATE TABLE x.t AS SELECT 1",
+		"USE memory; CREATE VIEW unite_legale AS SELECT 1 AS siren",
+		"CREATE TEMP TABLE unite_legale AS SELECT 1 AS siren",
+	)
+}
+
+func TestLockedPoolNotRebuiltWhenHealthy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sirene.duckdb")
+	place(t, dbA(t), path)
+	s := openStore(t, path)
+	ctx := context.Background()
+	query := func(db *sql.DB) error {
+		var n int64
+		return db.QueryRow("SELECT count(*) FROM unite_legale").Scan(&n)
+	}
+	if err := s.UseLocked(ctx, query); err != nil {
+		t.Fatal(err)
+	}
+	var limit string
+	if err := s.UseLocked(ctx, func(db *sql.DB) error {
+		return db.QueryRow("SELECT current_setting('memory_limit')").Scan(&limit)
+	}); err != nil || limit == "" {
+		t.Fatalf("memory_limit = %q, %v", limit, err)
+	}
+	t.Logf("locked memory_limit = %s", limit)
+	first := s.locked
+	if !lockedHealthy(first, s.lockedPath) {
+		t.Fatal("fresh locked pool reported unhealthy")
+	}
+	for range 3 {
+		if err := s.UseLocked(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.locked != first {
+		t.Fatal("healthy locked pool was rebuilt")
+	}
+	_ = s.UseLocked(ctx, func(db *sql.DB) error { _, err := db.Exec("USE memory; DETACH sirene"); return err })
+	if s.locked == first {
+		t.Fatal("broken locked pool was not rebuilt")
+	}
+}

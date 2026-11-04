@@ -29,7 +29,10 @@ type Store struct {
 	info   os.FileInfo // identity of the file the pools were opened on
 	main   *sql.DB
 	locked *sql.DB
-	closed bool
+	// lockedPath is the path DuckDB reports for the file attached in the locked
+	// instance; the health check compares against it.
+	lockedPath string
+	closed     bool
 }
 
 // Open returns a Store for path. It never fails: the file is opened on first use.
@@ -41,7 +44,11 @@ func (s *Store) Use(ctx context.Context, fn func(db *sql.DB) error) error {
 }
 
 // UseLocked runs fn with the locked-down pool meant for user SQL: no file or
-// network access, configuration locked.
+// network access, configuration locked. Whatever fn runs (USE, DETACH, ATTACH
+// ':memory:', CREATE TABLE in the memory catalog…), the next call gets a clean
+// pool: connections are never reused, and after fn a health check rebuilds the
+// locked instance if it was altered. Calls running concurrently with a hostile
+// fn may still see its effects.
 func (s *Store) UseLocked(ctx context.Context, fn func(db *sql.DB) error) error {
 	return s.use(ctx, true, fn)
 }
@@ -68,8 +75,17 @@ func (s *Store) use(ctx context.Context, locked bool, fn func(db *sql.DB) error)
 			if locked {
 				db = s.locked
 			}
-			defer s.mu.RUnlock()
-			return fn(db)
+			if !locked {
+				defer s.mu.RUnlock()
+				return fn(db)
+			}
+			err := fn(db)
+			healthy := lockedHealthy(db, s.lockedPath)
+			s.mu.RUnlock()
+			if !healthy {
+				s.rebuildLocked(db)
+			}
+			return err
 		}
 		s.mu.RUnlock()
 		if err := s.reopen(fi); err != nil {
@@ -105,38 +121,88 @@ func (s *Store) reopen(fi os.FileInfo) error {
 		return nil
 	}
 	s.closePools()
-	main, locked, err := openPools(s.path)
+	main, err := openPool(s.path, nil)
 	if err != nil {
 		return err
 	}
-	s.main, s.locked, s.info = main, locked, fi
+	locked, lockedPath, err := openLocked(s.path)
+	if err != nil {
+		main.Close()
+		return err
+	}
+	s.main, s.locked, s.lockedPath, s.info = main, locked, lockedPath, fi
 	return nil
 }
 
-// openPools opens the main and locked pools on path.
-//
-// Each pool gets its own in-memory DuckDB instance that ATTACHes the file
-// READ_ONLY, rather than opening "path?access_mode=read_only" directly: the
-// driver shares one instance per file path (its instance cache), so the locked
-// pool's global settings (enable_external_access, lock_configuration) would
-// leak into the main pool, and a reopen while another handle on the same path
-// is alive would get the old file back.
-func openPools(path string) (main, locked *sql.DB, err error) {
-	main, err = openPool(path, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	locked, err = openPool(path, []string{
-		"SET enable_external_access=false",
-		"SET lock_configuration=true",
-	})
-	if err != nil {
-		main.Close()
-		return nil, nil, err
-	}
-	return main, locked, nil
+// lockedSettings are applied once per locked instance, before the pool is used.
+var lockedSettings = []string{
+	"SET memory_limit='2GB'",
+	"SET enable_external_access=false",
+	"SET lock_configuration=true",
 }
 
+// openLocked opens the locked pool and returns the attached file's path as
+// DuckDB reports it.
+func openLocked(path string) (*sql.DB, string, error) {
+	db, err := openPool(path, lockedSettings)
+	if err != nil {
+		return nil, "", err
+	}
+	// No idle connections: per-connection state (USE, temp tables) dies with
+	// the connection, and every connection starts with USE sirene.
+	db.SetMaxIdleConns(0)
+	var attached string
+	if err := db.QueryRow("SELECT path FROM duckdb_databases() WHERE database_name = 'sirene'").Scan(&attached); err != nil {
+		db.Close()
+		return nil, "", fmt.Errorf("store: open %s: %w", path, err)
+	}
+	return db, attached, nil
+}
+
+// lockedHealthy reports whether the locked instance is still exactly as opened:
+// the file attached read-only as sirene, nothing else attached, and nothing
+// created in the memory catalog. A fresh connection runs the check, so a
+// detached sirene fails its USE init.
+func lockedHealthy(db *sql.DB, attached string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var ok bool
+	err := db.QueryRowContext(ctx, `SELECT
+	(SELECT count(*) FROM duckdb_databases() WHERE database_name = 'sirene' AND readonly AND path = `+quote(attached)+`) = 1
+	AND (SELECT count(*) FROM duckdb_databases() WHERE NOT internal AND database_name NOT IN ('sirene', 'memory')) = 0
+	AND (SELECT count(*) FROM duckdb_tables() WHERE database_name <> 'sirene') = 0
+	AND (SELECT count(*) FROM duckdb_views() WHERE NOT internal AND database_name <> 'sirene') = 0`).Scan(&ok)
+	return err == nil && ok
+}
+
+// rebuildLocked replaces the locked pool bad with a fresh one, unless another
+// caller already did. The main pool is not touched.
+func (s *Store) rebuildLocked(bad *sql.DB) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.locked != bad {
+		return
+	}
+	bad.Close()
+	s.locked = nil
+	db, attached, err := openLocked(s.path)
+	if err != nil {
+		s.closePools() // the next call reopens everything or reports ErrNoDatabase
+		return
+	}
+	// If the file was swapped meanwhile, the next call sees the identity change
+	// and reopens both pools.
+	s.locked, s.lockedPath = db, attached
+}
+
+func quote(v string) string { return "'" + strings.ReplaceAll(v, "'", "''") + "'" }
+
+// openPool opens a pool on path with its own in-memory DuckDB instance that
+// ATTACHes the file READ_ONLY, rather than opening "path?access_mode=read_only"
+// directly: the driver shares one instance per file path (its instance cache),
+// so the locked pool's global settings (enable_external_access,
+// lock_configuration) would leak into the main pool, and a reopen while another
+// handle on the same path is alive would get the old file back.
 func openPool(path string, settings []string) (*sql.DB, error) {
 	var ready atomic.Bool
 	c, err := duckdb.NewConnector(":memory:", func(execer driver.ExecerContext) error {
@@ -170,7 +236,7 @@ func setup(c *duckdb.Connector, path string, settings []string) error {
 	defer conn.Close()
 	execer := conn.(driver.ExecerContext)
 	stmts := append([]string{
-		"ATTACH '" + strings.ReplaceAll(path, "'", "''") + "' AS sirene (READ_ONLY)",
+		"ATTACH " + quote(path) + " AS sirene (READ_ONLY)",
 	}, settings...)
 	for _, q := range stmts {
 		if _, err := execer.ExecContext(ctx, q, nil); err != nil {
@@ -210,7 +276,7 @@ func (s *Store) closePools() {
 	if s.locked != nil {
 		s.locked.Close()
 	}
-	s.main, s.locked, s.info = nil, nil, nil
+	s.main, s.locked, s.lockedPath, s.info = nil, nil, "", nil
 }
 
 // Close closes the pools. Later calls to Use fail.
