@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/Noneo-Code/sirene-mcp/internal/nomenclature"
+	"github.com/Noneo-Code/sirene-mcp/internal/sirenetest"
+	"github.com/Noneo-Code/sirene-mcp/internal/store"
+	"github.com/Noneo-Code/sirene-mcp/internal/syncer"
 )
 
 func TestGetCompanyBySirenAndSiret(t *testing.T) {
@@ -85,6 +88,34 @@ func TestSearchNomenclatureKine(t *testing.T) {
 	}
 	if es, _ := SearchNomenclature(context.Background(), s, "naf", "", 3); len(es) != 3 {
 		t.Errorf("limit: %d", len(es))
+	}
+}
+
+func TestGetInfoIgnoresUnfinishedSync(t *testing.T) {
+	ul, etab := sirenetest.Default()
+	dir := t.TempDir()
+	ulPath, etabPath := sirenetest.Write(t, dir, ul, etab)
+	out := filepath.Join(dir, "sirene.duckdb")
+	if _, err := syncer.Build(context.Background(), syncer.BuildOptions{
+		ULParquet: ulPath, EtabParquet: etabPath, OutPath: out,
+		MemoryLimit: "1GB", TempDir: filepath.Join(dir, "tmp"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("duckdb", out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE sync_log SET finished_at = NULL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := store.Open(out)
+	defer s.Close()
+	if _, err := GetInfo(context.Background(), s); err == nil || !strings.Contains(err.Error(), "no completed sync") {
+		t.Fatalf("got %v", err)
 	}
 }
 
@@ -230,14 +261,23 @@ func TestRunSQLRefuses(t *testing.T) {
 		"FROM naf",
 		"",
 		"SELECT",
+		"WITH a AS (DELETE FROM naf RETURNING *) SELECT * FROM a",
+		"WITH a AS (UPDATE naf SET libelle='x' RETURNING *) SELECT * FROM a",
+		"WITH a AS (INSERT INTO memory.main.t VALUES (1) RETURNING *) SELECT * FROM a",
+		"SELECT 1 WHERE 1 IN (WITH b AS (DELETE FROM naf RETURNING 1) SELECT * FROM b)",
+		"SELECT * FROM (WITH b AS (UPDATE naf SET libelle='x' RETURNING code) SELECT * FROM b) s",
 	} {
 		if _, err := RunSQL(context.Background(), s, q, 0, 0); err == nil {
 			t.Errorf("%q: want error", q)
 		}
 	}
-	// The pool still works afterwards.
-	if _, err := RunSQL(context.Background(), s, "SELECT 1", 0, 0); err != nil {
+	// The pool still works afterwards, and nothing was deleted.
+	r, err := RunSQL(context.Background(), s, "SELECT count(*) FROM naf WHERE libelle <> 'x'", 0, 0)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if n := r.Rows[0][0].(int64); n < 700 {
+		t.Fatalf("naf rows = %d", n)
 	}
 }
 
@@ -250,13 +290,24 @@ func TestCheckSelect(t *testing.T) {
 			"DELETE FROM naf", "SELECT 1; SELECT 2", "SELECT 1; DROP TABLE naf", "COPY naf TO '/tmp/x.csv'",
 			"ATTACH '/tmp/x.duckdb'", "INSTALL httpfs", "SET enable_external_access=true", "USE memory",
 			"DETACH sirene", "PRAGMA version", "CALL pragma_version()", "EXPLAIN SELECT 1",
-			"WITH a AS (SELECT 1) DELETE FROM naf", "CREATE TABLE x AS SELECT 1", "garbage(",
+			"WITH a AS (SELECT 1) DELETE FROM naf",
+			"WITH a AS (DELETE FROM naf RETURNING *) SELECT * FROM a",
+			"WITH a AS (UPDATE naf SET libelle='x' RETURNING *) SELECT * FROM a",
+			"WITH a AS (INSERT INTO memory.main.t VALUES (1) RETURNING *) SELECT * FROM a",
+			"SELECT 1 WHERE 1 IN (WITH b AS (DELETE FROM naf RETURNING 1) SELECT * FROM b)",
+			"SELECT * FROM (WITH b AS (UPDATE naf SET libelle='x' RETURNING code) SELECT * FROM b) s",
+			"CREATE TABLE x AS SELECT 1", "garbage(",
 		} {
 			if err := checkSelect(context.Background(), db, q); err == nil {
 				t.Errorf("%q: want error", q)
 			}
 		}
-		for _, q := range []string{"SELECT 1", "WITH a AS (SELECT 1) SELECT * FROM a", "SELECT 1 UNION SELECT 2"} {
+		for _, q := range []string{
+			"SELECT 1", "WITH a AS (SELECT 1) SELECT * FROM a", "SELECT 1 UNION SELECT 2",
+			"SELECT 1 EXCEPT SELECT 2 INTERSECT SELECT 3", "WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a",
+			"WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3) SELECT * FROM r",
+			"SELECT 'DELETE_QUERY_NODE' AS type, 'returning_list' AS returning_list",
+		} {
 			if err := checkSelect(context.Background(), db, q); err != nil {
 				t.Errorf("%q: %v", q, err)
 			}

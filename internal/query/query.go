@@ -397,17 +397,19 @@ type Info struct {
 	MaxDateDernierTraitement string    `json:"max_date_dernier_traitement"`
 }
 
-// GetInfo reads the latest sync_log row and the freshest record date.
+// GetInfo reads the latest completed sync_log row (by finished_at) and the
+// freshest record date.
 func GetInfo(ctx context.Context, s *store.Store) (Info, error) {
 	var i Info
 	err := s.Use(ctx, func(db *sql.DB) error {
 		err := db.QueryRowContext(ctx, `SELECT finished_at, coalesce(exclude_closed,false), coalesce(ul_rows,0),
   coalesce(etab_rows,0), coalesce(ul_source,''), coalesce(etab_source,''), coalesce(ul_last_modified,''),
   coalesce(etab_last_modified,'')
-FROM sync_log ORDER BY finished_at DESC NULLS LAST LIMIT 1`).Scan(&i.LastSync, &i.ExcludeClosed, &i.ULRows,
+FROM sync_log WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1`).Scan(&i.LastSync, &i.ExcludeClosed, &i.ULRows,
 			&i.EtabRows, &i.ULSource, &i.EtabSource, &i.ULLastModified, &i.EtabLastModified)
 		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("sync_log is empty")
+			// Rows with a NULL finished_at are unfinished syncs: ignored.
+			return errors.New("sync_log has no completed sync (finished_at is empty)")
 		}
 		if err != nil {
 			return err
@@ -514,16 +516,20 @@ type SQLResult struct {
 
 // RunSQL runs one read-only SELECT written by the caller (an LLM) on the locked
 // pool, which has no file or network access and a locked configuration.
-// maxRows defaults to 1000 (capped at 10000) and timeout to 30s.
+// maxRows defaults to 1000 and is capped at 10000; timeout defaults to 30s.
 //
-// Validation, before anything runs: the first keyword must be SELECT or WITH
-// (after comments and opening parentheses), and DuckDB's own parser, through
-// json_serialize_sql, must find exactly one statement whose node is a
-// SELECT_NODE (WITH queries included) or a SET_OPERATION_NODE (UNION, EXCEPT,
-// INTERSECT of selects). json_serialize_sql only serializes SELECT statements:
-// anything else (DML, DDL, COPY, ATTACH, SET, PRAGMA, CALL, EXPLAIN…) comes
-// back as {"error": true}. Table functions reading files are SELECTs and are
-// stopped at execution by enable_external_access=false.
+// Validation, before anything runs (see checkSelect): the first keyword must
+// be SELECT or WITH (after comments and opening parentheses), and DuckDB's own
+// parser, through json_serialize_sql, must find exactly one statement whose
+// whole tree, CTEs and subqueries included, only holds read-only query nodes
+// (SELECT_NODE, SET_OPERATION_NODE, RECURSIVE_CTE_NODE, CTE_NODE) and no
+// RETURNING clause. json_serialize_sql only serializes SELECT statements:
+// top-level DML, DDL, COPY, ATTACH, SET, PRAGMA, CALL, EXPLAIN… come back as
+// {"error": true}, while data-modifying CTEs (WITH a AS (DELETE … RETURNING *)
+// SELECT …) serialize as DELETE/UPDATE/INSERT_QUERY_NODE and are caught by the
+// tree walk. The READ_ONLY attach of the file is a second layer, and table
+// functions reading files are stopped at execution by
+// enable_external_access=false.
 func RunSQL(ctx context.Context, s *store.Store, query string, maxRows int, timeout time.Duration) (SQLResult, error) {
 	if maxRows <= 0 {
 		maxRows = defaultSQLRows
@@ -609,8 +615,41 @@ func checkSelect(ctx context.Context, db *sql.DB, query string) error {
 	if len(parsed.Statements) != 1 {
 		return fmt.Errorf("exactly one statement is allowed, got %d", len(parsed.Statements))
 	}
-	if t := parsed.Statements[0].Node.Type; t != "SELECT_NODE" && t != "SET_OPERATION_NODE" {
-		return fmt.Errorf("only SELECT queries are allowed, got %s", t)
+	var tree any
+	if err := json.Unmarshal([]byte(raw), &tree); err != nil {
+		return fmt.Errorf("cannot parse query: %w", err)
+	}
+	return checkTree(tree)
+}
+
+// readOnlyNodes are the query node types a read-only query may contain.
+var readOnlyNodes = map[string]bool{
+	"SELECT_NODE": true, "SET_OPERATION_NODE": true, "RECURSIVE_CTE_NODE": true, "CTE_NODE": true,
+}
+
+// checkTree walks a json_serialize_sql tree and rejects any query node that is
+// not a read-only one (DELETE_QUERY_NODE, UPDATE_QUERY_NODE,
+// INSERT_QUERY_NODE, …), wherever it sits, and any RETURNING clause.
+func checkTree(v any) error {
+	switch x := v.(type) {
+	case map[string]any:
+		if _, ok := x["returning_list"]; ok {
+			return errors.New("only read-only SELECT queries are allowed (data-modifying clause found)")
+		}
+		if t, ok := x["type"].(string); ok && strings.HasSuffix(t, "_NODE") && !readOnlyNodes[t] {
+			return fmt.Errorf("only read-only SELECT queries are allowed, found %s", t)
+		}
+		for _, e := range x {
+			if err := checkTree(e); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if err := checkTree(e); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
