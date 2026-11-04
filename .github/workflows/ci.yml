@@ -33,7 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        # Linux binaries link against the runner's glibc: build on 22.04
+        # (glibc 2.35) like the release, so Debian 12 / Ubuntu 22.04 can run them.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -50,4 +52,4 @@ jobs:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.15.0

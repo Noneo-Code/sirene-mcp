@@ -294,7 +294,7 @@ func printStatus(w io.Writer, p config.Paths) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "database:  %s\nsize:      %.2f GB\n", p.DB, float64(st.Size())/(1<<30))
+	fmt.Fprintf(w, "database:  %s\nsize:      %.2f GiB\n", p.DB, float64(st.Size())/(1<<30))
 	db, err := sql.Open("duckdb", p.DB+"?access_mode=read_only")
 	if err != nil {
 		return err
